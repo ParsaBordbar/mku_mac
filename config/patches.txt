@@ -1,0 +1,32 @@
+# Functions that are NOT recompiled: the generated rc_func_* calls a hand-written
+# C replacement instead. Use this for code that plain C cannot express
+# (stack switching, jumps into the middle of functions).
+#
+# address (module-relative)   C function            what it replaces
+0x1DC644  proc_run             # simple process manager: run
+0x1DC614  proc_chain           # simple: chain
+0x1DC794  proc_run             # stack-copying process manager: run
+0x1DCA98  proc_sleep           # stack-copying: sleep
+0x1DC764  proc_chain           # stack-copying: chain
+0x1DCD3C  proc_run             # private-stack process manager: run
+0x1DD024  proc_sleep           # private-stack: sleep
+0x1DCD08  proc_chain           # private-stack: chain
+0x1DCCC8  proc_to_main_stack   # private-stack: switch to main stack
+0x1DCCE8  proc_from_main_stack # private-stack: switch back
+
+# setjmp/longjmp: MK changes game mode by longjmp-ing back into main(). A call
+# to setjmp is rewritten as a real host setjmp in the calling (recompiled)
+# function's own frame ("@setjmp"); longjmp is replaced by rt_longjmp.
+0x247D84  @setjmp              # setjmp(buf)
+0x247DE8  rt_longjmp           # longjmp(buf, value)
+
+# Instruction word patches: `address @word:OLD:NEW`. OLD is checked first.
+#
+# 60 fps: func_00061400 is MK's frame limiter. It measures the frame time with
+# sceKernelGetSystemTimeLow and, if the frame took less than 20000 us, sleeps
+# the rest: a 50 fps cap (on a real PSP, waiting for vblank on top of that
+# makes ~30 fps). It also stores 0.02 / frame time as the game's speed factor,
+# so gameplay speed follows the real frame time. Lowering the cap to 16000 us
+# leaves the pacing to the vblank wait in sceCtrlReadBufferPositive: 60 fps.
+0x61498  @word:28A74E20:28A73E80   # slti $a3, $a1, 20000  ->  16000
+0x614C0  @word:34074E20:34073E80   # ori  $a3, $zero, 20000 -> 16000

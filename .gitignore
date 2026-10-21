@@ -1,0 +1,13 @@
+# Never commit game data or anything derived from it.
+*.iso
+*.cso
+*.elf
+*.BIN
+*.bin
+*.IMP
+build/
+third_party/*
+!third_party/README.md
+
+__pycache__/
+.DS_Store

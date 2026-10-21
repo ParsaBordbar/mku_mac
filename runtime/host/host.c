@@ -13,7 +13,9 @@
 #include <SDL.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <math.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -143,8 +145,62 @@ static uint32_t analog(const Uint8 *k) {
     return (uint32_t)lx | ((uint32_t)ly << 8);
 }
 
+/* Free camera (host side only; the game never knows). Angles in radians,
+ * zoom in view-space units toward the orbit point. The renderer reads it via
+ * host_camera(). MKU_CAM="yaw,pitch,zoom" fixes it (for test screenshots). */
+static _Atomic float g_cam_yaw, g_cam_pitch, g_cam_zoom;
+
+void host_camera(float *yaw, float *pitch, float *zoom) {
+    *yaw = atomic_load(&g_cam_yaw);
+    *pitch = atomic_load(&g_cam_pitch);
+    *zoom = atomic_load(&g_cam_zoom);
+}
+
+static void camera_init_from_env(void) {
+    const char *e = getenv("MKU_CAM");
+    float y = 0, p = 0, z = 0;
+    if (e && sscanf(e, "%f,%f,%f", &y, &p, &z) >= 2) {
+        atomic_store(&g_cam_yaw, y);
+        atomic_store(&g_cam_pitch, p);
+        atomic_store(&g_cam_zoom, z);
+    }
+}
+
+static void camera_update(const Uint8 *k, float dt) {
+    float dyaw = 0, dpitch = 0, dzoom = 0;
+    int reset = k[SDL_SCANCODE_C];
+    if (k[SDL_SCANCODE_F]) dyaw -= 1;
+    if (k[SDL_SCANCODE_H]) dyaw += 1;
+    if (k[SDL_SCANCODE_T]) dpitch -= 1;
+    if (k[SDL_SCANCODE_G]) dpitch += 1;
+    if (k[SDL_SCANCODE_R]) dzoom += 1;
+    if (k[SDL_SCANCODE_Y]) dzoom -= 1;
+    if (g_pad) {
+        float rx = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_RIGHTX) / 32768.f;
+        float ry = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_RIGHTY) / 32768.f;
+        if (fabsf(rx) < 0.15f) rx = 0;   /* dead zone */
+        if (fabsf(ry) < 0.15f) ry = 0;
+        if (SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) dzoom -= ry;
+        else { dyaw += rx; dpitch += ry; }
+        if (SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_LEFTSTICK)) reset = 1;
+    }
+    if (reset) {
+        atomic_store(&g_cam_yaw, 0.f);
+        atomic_store(&g_cam_pitch, 0.f);
+        atomic_store(&g_cam_zoom, 0.f);
+        return;
+    }
+    float pitch = atomic_load(&g_cam_pitch) + dpitch * 1.5f * dt;
+    if (pitch > 1.3f) pitch = 1.3f;
+    if (pitch < -1.3f) pitch = -1.3f;
+    atomic_store(&g_cam_yaw, atomic_load(&g_cam_yaw) + dyaw * 1.8f * dt);
+    atomic_store(&g_cam_pitch, pitch);
+    atomic_store(&g_cam_zoom, atomic_load(&g_cam_zoom) + dzoom * 4.f * dt);
+}
+
 /* Main thread, forever. */
 void host_run(void) {
+    camera_init_from_env();
     if (g_headless) {
         for (;;) pause();
     }
@@ -168,6 +224,15 @@ void host_run(void) {
         const Uint8 *k = SDL_GetKeyboardState(NULL);
         atomic_store(&g_buttons, keyboard_buttons(k) | pad_buttons());
         atomic_store(&g_analog, analog(k));
+        {
+            static uint64_t last;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+            float dt = last ? (now - last) / 1e6f : 0.f;
+            last = now;
+            camera_update(k, dt > 0.1f ? 0.1f : dt);
+        }
 
         int have = 0;
         pthread_mutex_lock(&g_frame_lock);

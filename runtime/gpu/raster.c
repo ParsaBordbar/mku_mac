@@ -14,6 +14,7 @@
  */
 #include "gpu.h"
 #include "ge_cmds.h"
+#include "../host/host.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -837,13 +838,54 @@ static void queue_job(int pipe, const Vert *a, const Vert *b, const Vert *c, int
 /* ------------------------------------------------------------------------ */
 /* transform */
 
-static int transform(const float pos[3], Vert *out) {
-    float wv[3], vv[3], c[4];
+/* Free camera: an orbit around a point in front of the game's camera, applied
+ * in view space (so the game's own camera still moves as it likes). The orbit
+ * point's depth follows the skinned models (the fighters) of the last frame. */
+static struct { float cy, sy, cp, sp, zoom; int on; } g_cam;
+static float g_pivot_z = -8.f;
+static double g_pivot_acc, g_pivot_acc_all;
+static unsigned g_pivot_n, g_pivot_n_all;
+
+void gpu_frame_end(void) {   /* present.c, once per shown frame */
+    if (g_pivot_n) g_pivot_z = (float)(g_pivot_acc / g_pivot_n);
+    else if (g_pivot_n_all) g_pivot_z = (float)(g_pivot_acc_all / g_pivot_n_all);
+    g_pivot_acc = g_pivot_acc_all = 0;
+    g_pivot_n = g_pivot_n_all = 0;
+}
+
+static void camera_setup(void) {
+    float yaw, pitch, zoom;
+    host_camera(&yaw, &pitch, &zoom);
+    g_cam.on = yaw != 0.f || pitch != 0.f || zoom != 0.f;
+    g_cam.cy = cosf(yaw); g_cam.sy = sinf(yaw);
+    g_cam.cp = cosf(pitch); g_cam.sp = sinf(pitch);
+    g_cam.zoom = zoom;
+}
+
+static void camera_apply(float v[3]) {
+    float pz = g_pivot_z;
+    float x = v[0], y = v[1], z = v[2] - pz;
+    float x1 = g_cam.cy * x + g_cam.sy * z, z1 = -g_cam.sy * x + g_cam.cy * z;   /* yaw: around y */
+    float y2 = g_cam.cp * y - g_cam.sp * z1, z2 = g_cam.sp * y + g_cam.cp * z1;  /* pitch: around x */
+    v[0] = x1;
+    v[1] = y2;
+    v[2] = z2 + pz + (pz < 0 ? g_cam.zoom : -g_cam.zoom);   /* zoom: toward the orbit point */
+}
+
+/* object space -> clip space (before the divide by w) */
+static void transform(const float pos[3], int skinned, float c[4]) {
+    float wv[3], vv[3];
     mul43(ge.world, pos, wv);
     mul43(ge.view, wv, vv);
+    if (skinned) { g_pivot_acc += vv[2]; g_pivot_n++; }
+    g_pivot_acc_all += vv[2]; g_pivot_n_all++;
+    if (g_cam.on) camera_apply(vv);
     const float *m = ge.proj;
     for (int i = 0; i < 4; i++) c[i] = vv[0] * m[i] + vv[1] * m[4 + i] + vv[2] * m[8 + i] + m[12 + i];
-    if (c[3] <= 0.f) return 0;   /* behind the camera: dropped (no clipping yet) */
+}
+
+/* clip space -> screen (viewport, offset); w becomes 1/w for perspective */
+static void project(const float c[4], Vert *out) {
     float iw = 1.f / c[3];
     float sx = ge_float(ge.cmd[GE_VIEWPORTXSCALE]), cx = ge_float(ge.cmd[GE_VIEWPORTXCENTER]);
     float sy = ge_float(ge.cmd[GE_VIEWPORTYSCALE]), cy = ge_float(ge.cmd[GE_VIEWPORTYCENTER]);
@@ -852,7 +894,66 @@ static int transform(const float pos[3], Vert *out) {
     out->y = c[1] * iw * sy + cy - (float)(ge.cmd[GE_OFFSETY] & 0xFFFF) / 16.f;
     out->z = c[2] * iw * sz + cz;
     out->w = iw;
-    return 1;
+}
+
+/* Near-plane clipping. A triangle with a vertex behind the camera (w <= NEAR_W)
+ * is cut against the plane w = NEAR_W (Sutherland-Hodgman, one plane) in clip
+ * space, where all attributes are still linear, giving up to two triangles. */
+#define NEAR_W 1e-3f
+
+typedef struct { float c[4], u, v, r, g, b, a; } ClipV;
+
+static float g_clip[MAX_VERTS][4];
+
+static ClipV clipv(int i) {
+    const Vert *v = &g_verts[i];
+    ClipV o = {{g_clip[i][0], g_clip[i][1], g_clip[i][2], g_clip[i][3]}, v->u, v->v, v->r, v->g, v->b, v->a};
+    return o;
+}
+
+static ClipV lerp_clip(const ClipV *p, const ClipV *q, float t) {
+    ClipV o;
+    for (int k = 0; k < 4; k++) o.c[k] = p->c[k] + (q->c[k] - p->c[k]) * t;
+    o.u = p->u + (q->u - p->u) * t; o.v = p->v + (q->v - p->v) * t;
+    o.r = p->r + (q->r - p->r) * t; o.g = p->g + (q->g - p->g) * t;
+    o.b = p->b + (q->b - p->b) * t; o.a = p->a + (q->a - p->a) * t;
+    return o;
+}
+
+static Vert screen_of(const ClipV *p) {
+    Vert v;
+    project(p->c, &v);
+    v.u = p->u; v.v = p->v; v.r = p->r; v.g = p->g; v.b = p->b; v.a = p->a;
+    return v;
+}
+
+uint64_t g_tris_clipped;
+
+static void queue_job(int pipe, const Vert *a, const Vert *b, const Vert *c, int sprite);
+
+/* One 3D triangle (vertex indices). `flat` (provoking vertex) colours flat-shaded triangles. */
+static void tri3d(int pipe, int i0, int i1, int i2, const uint8_t *ok) {
+    if (ok[i0] && ok[i1] && ok[i2]) {
+        queue_job(pipe, &g_verts[i0], &g_verts[i1], &g_verts[i2], 0);
+        return;
+    }
+    g_tris_clipped++;
+    ClipV in[3] = {clipv(i0), clipv(i1), clipv(i2)}, out[4];
+    int n = 0;
+    for (int k = 0; k < 3; k++) {
+        const ClipV *p = &in[k], *q = &in[(k + 1) % 3];
+        int pin = p->c[3] > NEAR_W, qin = q->c[3] > NEAR_W;
+        if (pin) out[n++] = *p;
+        if (pin != qin) out[n++] = lerp_clip(p, q, (NEAR_W - p->c[3]) / (q->c[3] - p->c[3]));
+    }
+    if (n < 3) return;
+    Vert sv[4];
+    for (int k = 0; k < n; k++) sv[k] = screen_of(&out[k]);
+    /* flat shading uses the last original vertex's colour */
+    for (int k = 0; k < n; k++)
+        if (!g_pipes[pipe].gouraud) { sv[k].r = in[2].r; sv[k].g = in[2].g; sv[k].b = in[2].b; sv[k].a = in[2].a; }
+    queue_job(pipe, &sv[0], &sv[1], &sv[2], 0);
+    if (n == 4) queue_job(pipe, &sv[0], &sv[2], &sv[3], 0);
 }
 
 static void draw_prim_impl(uint32_t data);
@@ -876,6 +977,7 @@ static void draw_prim_impl(uint32_t data) {
     float sv = ge.cmd[GE_TEXSCALEV] ? ge_float(ge.cmd[GE_TEXSCALEV]) : 1.f;
     float ou = ge_float(ge.cmd[GE_TEXOFFSETU]), ov = ge_float(ge.cmd[GE_TEXOFFSETV]);
 
+    if (!f.through) camera_setup();
     uint8_t *ok = malloc((size_t)count);
     for (int i = 0; i < count; i++) {
         uint32_t index = (uint32_t)i;
@@ -891,7 +993,9 @@ static void draw_prim_impl(uint32_t data) {
             v->u = uv[0]; v->v = uv[1];
             ok[i] = 1;
         } else {
-            ok[i] = (uint8_t)transform(pos, v);
+            transform(pos, f.wt != 0, g_clip[i]);
+            ok[i] = g_clip[i][3] > NEAR_W;
+            if (ok[i]) project(g_clip[i], v);
             v->u = (uv[0] * su + ou) * (p.textured ? p.tex.w : 1);
             v->v = (uv[1] * sv + ov) * (p.textured ? p.tex.h : 1);
         }
@@ -919,15 +1023,18 @@ static void draw_prim_impl(uint32_t data) {
     switch (type) {
     case 3:   /* triangles */
         for (int i = 0; i + 2 < count; i += 3)
-            if (ok[i] && ok[i + 1] && ok[i + 2]) queue_job(pi, &g_verts[i], &g_verts[i + 1], &g_verts[i + 2], 0);
+            if (f.through) { if (ok[i] && ok[i + 1] && ok[i + 2]) queue_job(pi, &g_verts[i], &g_verts[i + 1], &g_verts[i + 2], 0); }
+            else tri3d(pi, i, i + 1, i + 2, ok);
         break;
     case 4:   /* strip */
         for (int i = 0; i + 2 < count; i++)
-            if (ok[i] && ok[i + 1] && ok[i + 2]) queue_job(pi, &g_verts[i], &g_verts[i + 1], &g_verts[i + 2], 0);
+            if (f.through) { if (ok[i] && ok[i + 1] && ok[i + 2]) queue_job(pi, &g_verts[i], &g_verts[i + 1], &g_verts[i + 2], 0); }
+            else tri3d(pi, i, i + 1, i + 2, ok);
         break;
     case 5:   /* fan */
         for (int i = 1; i + 1 < count; i++)
-            if (ok[0] && ok[i] && ok[i + 1]) queue_job(pi, &g_verts[0], &g_verts[i], &g_verts[i + 1], 0);
+            if (f.through) { if (ok[0] && ok[i] && ok[i + 1]) queue_job(pi, &g_verts[0], &g_verts[i], &g_verts[i + 1], 0); }
+            else tri3d(pi, 0, i, i + 1, ok);
         break;
     case 6:   /* sprites */
         for (int i = 0; i + 1 < count; i += 2)

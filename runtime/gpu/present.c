@@ -104,6 +104,7 @@ void present_frame_shown(uint64_t frame) {
     if (dump_at == -2) dump_at = getenv("MKU_GE_DUMP") ? atol(getenv("MKU_GE_DUMP")) : -1;
     g_dump_draws = dump_at >= 0 && frame >= (uint64_t)dump_at && frame < (uint64_t)dump_at + 2;
     gpu_texture_flush();   /* re-validate textures at least once per frame */
+    gpu_frame_end();
     static uint32_t rgba[SCREEN_W * SCREEN_H];
     if (present_capture(rgba)) host_submit_frame(rgba);
     static const char *shots = (const char *)-1;

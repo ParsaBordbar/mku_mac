@@ -8,6 +8,7 @@ void host_run(void);                        /* main thread, never returns */
 void host_submit_frame(const uint32_t *rgba);   /* game thread: a finished 480x272 frame */
 uint32_t host_buttons(void);                /* PSP button bits currently held */
 uint32_t host_analog(void);                 /* lx | ly << 8, 128 = centre */
+void host_camera(float *yaw, float *pitch, float *zoom);   /* free camera (right stick) */
 
 /* audio.c: sound output (SDL); not available when headless */
 void host_audio_init(void);

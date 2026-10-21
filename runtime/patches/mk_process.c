@@ -46,6 +46,7 @@ enum { P_ALIVE = 4, P_SLEEP = 12, P_HOOK = 120, P_ENTRY = 124, P_RESUME = 128, P
 typedef struct {
     uint32_t proc;            /* guest address of the process struct */
     int live;                 /* has a suspended call chain (it slept) */
+    uint32_t resume;          /* P_RESUME when it slept: identifies that suspension */
     Fiber fiber;
     void *host_stack;
     uint32_t guest_stack_top;
@@ -125,7 +126,18 @@ void proc_run(Ctx *c) {
     MEM_SW(SCHED_RA, c->r[31]);
     MEM_SW(SCHED_SP, c->r[29]);
     for (;;) {
-        ProcFiber *f = fiber_for(MEM_LW(CUR_PROC));
+        uint32_t cur = MEM_LW(CUR_PROC);
+        ProcFiber *f = fiber_for(cur);
+        /* Resume only what the game itself considers suspended: like the
+         * original run(), "stack top - saved sp > 0". A process struct that was
+         * freed and reused for a new process at the same address is fresh
+         * (saved sp = stack top) and must not inherit the old fiber. */
+        if (f->live && ((int32_t)(MEM_LW(cur + P_STACKTOP) - MEM_LW(cur + P_SAVEDSP)) <= 0 ||
+                        MEM_LW(cur + P_RESUME) != f->resume)) {
+            static int reported;
+            if (reported++ < 5) fprintf(stderr, "[proc] 0x%08X: stale suspended fiber dropped (process restarted)\n", cur);
+            f->live = 0;
+        }
         if (!f->live) {   /* (re)start: fresh registers, empty stacks */
             f->ctx = *c;
             f->ctx.r[29] = f->guest_stack_top;
@@ -145,6 +157,7 @@ void proc_run(Ctx *c) {
 
         if (g_exit == EXIT_SLEEP) {   /* it slept: resume it next time */
             f->live = 1;
+            f->resume = MEM_LW(MEM_LW(CUR_PROC) + P_RESUME);
             c->f[0] = lwf(SLEEP_DEFAULT);
             return;
         }
@@ -166,7 +179,7 @@ void proc_run(Ctx *c) {
         float sleep = lwf(MEM_LW(CUR_PROC) + P_SLEEP);
         if (0.0f <= sleep) return;
         /* A negative sleep time means "kill me": call the class's kill function. */
-        uint32_t cur = MEM_LW(CUR_PROC);
+        cur = MEM_LW(CUR_PROC);
         uint32_t kill = MEM_LW(MEM_LW(cur) + 16);
         MEM_SW(KILL_FLAG, 0);
         c->r[4] = cur;

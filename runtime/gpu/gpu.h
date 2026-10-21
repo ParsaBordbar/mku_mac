@@ -37,6 +37,7 @@ void gpu_block_transfer(uint32_t data);   /* TRANSFERSTART */
 void gpu_load_clut(void);                 /* LOADCLUT */
 void gpu_texture_flush(void);             /* TEXFLUSH: re-validate cached textures */
 void gpu_flush(void);                     /* draw all queued primitives */
+void gpu_frame_end(void);                 /* once per shown frame (free camera bookkeeping) */
 void gpu_stats_report(void);   /* ge.c: command counts (MKU_GE_STATS=1) */
 void gpu_draw_report(void);    /* raster.c */
 

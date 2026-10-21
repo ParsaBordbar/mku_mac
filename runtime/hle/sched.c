@@ -325,9 +325,40 @@ void kernel_dump_threads(FILE *f) {
 
 static Thread *g_root;
 
+extern uint64_t display_frame_count(void);
+
+/* MKU_TIMEOUT=s: dump state and exit after s seconds -- or earlier, as soon
+ * as the game has shown no new frame for 15 s (a hang). */
 static void *watchdog(void *arg) {
-    sleep((unsigned)(uintptr_t)arg);
+    unsigned limit = (unsigned)(uintptr_t)arg, stalled = 0;
+    uint64_t last = 0;
+    for (unsigned t = 0; t < limit; t++) {
+        sleep(1);
+        uint64_t f = display_frame_count();
+        stalled = f && f == last ? stalled + 1 : 0;
+        last = f;
+        if (stalled >= 15) {
+            fprintf(stderr, "\n[kernel] HANG: no new frame for 15 s (at %u s, frame %llu)\n", t + 1, (unsigned long long)f);
+            break;
+        }
+    }
     fprintf(stderr, "\n[kernel] MKU_TIMEOUT reached after %lus. Threads:\n", (unsigned long)(uintptr_t)arg);
+    {   /* what is running right now: 2000 samples of the last entered function */
+        enum { N = 2000 };
+        static uint32_t seen[64], hits[64];
+        int n = 0;
+        for (int i = 0; i < N; i++) {
+            uint32_t f = rt_cur_fn;
+            int k;
+            for (k = 0; k < n && seen[k] != f; k++) {}
+            if (k == n && n < 64) { seen[n] = f; hits[n] = 0; n++; }
+            if (k < 64) hits[k]++;
+            usleep(100);
+        }
+        fprintf(stderr, "[kernel] running now (%d samples over 0.2 s):\n", N);
+        for (int k = 0; k < n; k++)
+            if (hits[k] * 100 >= N) fprintf(stderr, "    %5.1f%%  func_%08X\n", 100.0 * hits[k] / N, seen[k] - rt_image_base);
+    }
     kernel_dump_threads(stderr);
     rt_hle_report();
     gpu_stats_report();

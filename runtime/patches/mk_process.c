@@ -54,7 +54,7 @@ typedef struct {
     RtShadow shadow;          /* its recompiled call chain (debugging) */
 } ProcFiber;
 
-enum Exit { EXIT_SLEEP, EXIT_RETURN, EXIT_CHAIN };
+enum Exit { EXIT_SLEEP, EXIT_RETURN, EXIT_CHAIN, EXIT_DIE };
 
 static ProcFiber *g_procs[MAX_PROCS];
 static int g_nprocs;
@@ -155,6 +155,16 @@ void proc_run(Ctx *c) {
         g_cur = NULL;
         share_vfpu(c, &f->ctx);
 
+        if (g_exit == EXIT_DIE) {   /* die(): kill it from the scheduler, never resume it */
+            f->live = 0;
+            if (MEM_LW(cur + P_ALIVE) != 0) {
+                MEM_SW(KILL_FLAG, 0);
+                c->r[4] = cur;
+                rt_call_indirect(c, MEM_LW(MEM_LW(cur) + 16));
+            }
+            return;
+        }
+
         if (g_exit == EXIT_SLEEP) {   /* it slept: resume it next time */
             f->live = 1;
             f->resume = MEM_LW(MEM_LW(CUR_PROC) + P_RESUME);
@@ -219,6 +229,31 @@ void proc_chain(Ctx *pc) {
     }
     g_exit = EXIT_CHAIN;
     g_exit_f0 = pc->f[12];
+    fiber_switch(&f->fiber, &g_sched);
+    abort();   /* never resumed */
+}
+
+/* die() (0x1DC578): the running process ends itself. The original calls the
+ * hook, then -- if the process is still alive -- its class's kill function on
+ * the scheduler's stack, and jumps straight back into the scheduler: it never
+ * returns to its caller. Recompiled as plain C it *did* return, and the dead
+ * process went on running, releasing its handles a second time (a cycle in
+ * the handle free list at 0x30E964: the game hung after the first fight). */
+void proc_die(Ctx *pc) {
+    ProcFiber *f = g_cur;
+    uint32_t cur = MEM_LW(CUR_PROC);
+    uint32_t hook = MEM_LW(cur + P_HOOK);
+    if (hook) rt_call_indirect(pc, hook);
+    if (!f) {   /* not inside a process (shouldn't happen): just kill it */
+        LOG(" outside a process (ra=0x%08X)", pc->r[31]);
+        if (MEM_LW(cur + P_ALIVE) != 0) {
+            MEM_SW(KILL_FLAG, 0);
+            pc->r[4] = cur;
+            rt_call_indirect(pc, MEM_LW(MEM_LW(cur) + 16));
+        }
+        return;
+    }
+    g_exit = EXIT_DIE;
     fiber_switch(&f->fiber, &g_sched);
     abort();   /* never resumed */
 }

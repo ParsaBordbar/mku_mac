@@ -13,6 +13,7 @@
 0x1DCD08  proc_chain           # private-stack: chain
 0x1DCCC8  proc_to_main_stack   # private-stack: switch to main stack
 0x1DCCE8  proc_from_main_stack # private-stack: switch back
+0x1DC578  proc_die             # the running process ends itself (never returns)
 
 # setjmp/longjmp: MK changes game mode by longjmp-ing back into main(). A call
 # to setjmp is rewritten as a real host setjmp in the calling (recompiled)

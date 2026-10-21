@@ -482,8 +482,12 @@ static int blend_factor(int which, int f, Rgba s, Rgba d, Rgba fix, int ch) {
     }
 }
 
+static uint64_t g_bench_pixels;   /* MKU_RASTER_BENCH: pixels shaded in the serial replay */
+static int g_bench_counting;
+
 static void shade_pixel(const Pipe *p, int x, int y, float z, float u, float v, Rgba col) {
     if (x < p->sx1 || x > p->sx2 || y < p->sy1 || y > p->sy2) return;
+    if (g_bench_counting) g_bench_pixels++;
     int bpp = p->fb_fmt == 3 ? 4 : 2;
     uint32_t fa = p->fb + (uint32_t)((y * p->fb_stride + x) * bpp);
     uint32_t za = p->zb + (uint32_t)((y * p->zb_stride + x) * 2);
@@ -765,9 +769,44 @@ static void run_batch(int threads) {
     pthread_mutex_unlock(&g_pool_lock);
 }
 
+/* MKU_RASTER_BENCH=1: after drawing each batch for real, replay it on one
+ * thread (on a saved copy of VRAM) and time it: the renderer's own cost,
+ * independent of thread scheduling. Reported every 300 frames. */
+static int g_bench = -1;
+static uint64_t g_bench_us, g_bench_jobs;
+static uint8_t g_bench_vram[VRAM_SIZE];
+
+void raster_bench_report(void) {
+    static unsigned frames;
+    if (g_bench != 1 || ++frames % 300) return;
+    fprintf(stderr, "[bench] serial raster: %.2f ms/frame, %.1f ns/pixel, %.0f pixels/frame, %.0f prims/frame\n",
+            g_bench_us / 1000.0 / 300, g_bench_pixels ? g_bench_us * 1000.0 / g_bench_pixels : 0.0,
+            g_bench_pixels / 300.0, g_bench_jobs / 300.0);
+    g_bench_us = g_bench_pixels = g_bench_jobs = 0;
+}
+
+static void bench_batch(void) {
+    memcpy(g_bench_vram, rt_ptr(VRAM_BASE), VRAM_SIZE);   /* state before the batch */
+}
+
+static void bench_replay(void) {
+    static uint8_t after[VRAM_SIZE];
+    memcpy(after, rt_ptr(VRAM_BASE), VRAM_SIZE);
+    memcpy(rt_ptr(VRAM_BASE), g_bench_vram, VRAM_SIZE);
+    g_bench_counting = 1;
+    uint64_t t0 = now_us();
+    draw_unbanded();
+    g_bench_us += now_us() - t0;
+    g_bench_counting = 0;
+    g_bench_jobs += (uint64_t)g_njobs;
+    memcpy(rt_ptr(VRAM_BASE), after, VRAM_SIZE);
+}
+
 void gpu_flush(void) {
     if (!g_njobs) return;
     if (!g_nthreads) pool_init();
+    if (g_bench < 0) g_bench = getenv("MKU_RASTER_BENCH") != NULL;
+    if (g_bench) bench_batch();
     uint64_t t0 = now_us();
     static int check = -1;
     if (check < 0) check = getenv("MKU_RASTER_CHECK") != NULL;
@@ -791,11 +830,12 @@ void gpu_flush(void) {
     } else {
         run_batch(g_nthreads);
     }
+    if (g_bench) bench_replay();
     g_njobs = 0;
     g_npipes = 0;
     g_batch_ymax = 0;
     g_batch_fb = 0xFFFFFFFFu;
-    g_raster_us += now_us() - t0;
+    if (!g_bench) g_raster_us += now_us() - t0;
 }
 
 static int queue_pipe(const Pipe *p) {

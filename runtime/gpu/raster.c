@@ -25,6 +25,7 @@
 
 uint64_t g_raster_us;   /* time spent rasterising (MKU_FPS stats) */
 uint64_t g_tris_queued, g_tris_culled_w, g_draws_3d;   /* MKU_FPS stats */
+uint64_t g_area_kind[3];   /* bounding-box pixels: clears, sprites, triangles */
 int g_dump_draws;   /* set by present.c for the MKU_GE_DUMP frame */
 extern uint64_t now_us(void);
 void gpu_flush(void);
@@ -44,7 +45,13 @@ static unsigned g_prims[8], g_through[2], g_transfers, g_texfmt[16];
 static int g_warned[16];
 #define WARN_ONCE(id, ...) do { if (!g_warned[id]++) fprintf(stderr, "[gpu] " __VA_ARGS__); } while (0)
 
+extern uint64_t g_fallback[3];
+extern uint32_t g_fallback_mask, g_fallback_blend;
+
 void gpu_draw_report(void) {
+    fprintf(stderr, "[gpu] reference-path pixels: stencil %llu, blend %llu (last mode 0x%X), colour mask %llu (last 0x%08X)\n",
+            (unsigned long long)g_fallback[0], (unsigned long long)g_fallback[1], g_fallback_blend,
+            (unsigned long long)g_fallback[2], g_fallback_mask);
     static const char *pn[] = {"points", "lines", "linestrip", "triangles", "tristrip", "trifan", "sprites", "?"};
     fprintf(stderr, "[gpu] prims:");
     for (int i = 0; i < 8; i++) if (g_prims[i]) fprintf(stderr, " %s=%u", pn[i], g_prims[i]);
@@ -67,7 +74,7 @@ static const uint8_t k6[64] = {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 45, 49, 
                                162, 166, 170, 174, 178, 182, 186, 190, 194, 198, 202, 206, 210, 215, 219, 223, 227,
                                231, 235, 239, 243, 247, 251, 255};
 
-static Rgba unpack(uint32_t p, int fmt) {   /* fmt: 0=565 1=5551 2=4444 3=8888 */
+static inline __attribute__((always_inline)) Rgba unpack(uint32_t p, int fmt) {   /* fmt: 0=565 1=5551 2=4444 3=8888 */
     Rgba c;
     switch (fmt) {
     case 0:
@@ -86,7 +93,7 @@ static Rgba unpack(uint32_t p, int fmt) {   /* fmt: 0=565 1=5551 2=4444 3=8888 *
     return c;
 }
 
-static uint32_t pack(Rgba c, int fmt) {
+static inline __attribute__((always_inline)) uint32_t pack(Rgba c, int fmt) {
     switch (fmt) {
     case 0: return (uint32_t)((c.r >> 3) | ((c.g >> 2) << 5) | ((c.b >> 3) << 11));
     case 1: return (uint32_t)((c.r >> 3) | ((c.g >> 3) << 5) | ((c.b >> 3) << 10) | ((c.a >> 7) << 15));
@@ -311,7 +318,10 @@ static void decode_texture(TexEntry *e, const Texture *t) {
 
 static const uint32_t *cached_texture(const Texture *t) {
     /* queued draws may still render into this texture (render-to-texture) */
-    if ((t->addr & 0x0FE00000u) == (VRAM_BASE & 0x0FE00000u)) gpu_flush();
+    if ((t->addr & 0x0FE00000u) == (VRAM_BASE & 0x0FE00000u)) {
+        gpu_flush();
+        surf_writeback(t->addr, (uint32_t)t->stride * (uint32_t)t->h * (uint32_t)bits_per_texel(t->fmt) / 8);
+    }
     uint32_t pal = t->fmt >= 4 && t->fmt <= 7;
     uint32_t key = (uint32_t)t->fmt | (uint32_t)t->w << 4 | (uint32_t)t->h << 16 | (uint32_t)t->swizzled << 30 |
                    (uint32_t)t->stride * 2654435761u;
@@ -345,17 +355,47 @@ static inline uint32_t texel(const Texture *t, int x, int y) {
 
 static inline Rgba rgba_of(uint32_t p) { return (Rgba){(int)(p & 255), (int)((p >> 8) & 255), (int)((p >> 16) & 255), (int)(p >> 24)}; }
 
-static Rgba sample(const Texture *t, float u, float v) {
+/* Bilinear (or nearest) texture lookup. The 2x2 footprint's wrapped/clamped
+ * coordinates are worked out once, not per texel. */
+static inline __attribute__((always_inline)) Rgba sample(const Texture *t, float u, float v) {
     if (!t->linear) return rgba_of(texel(t, (int)floorf(u), (int)floorf(v)));
     float fu = u - 0.5f, fv = v - 0.5f;
-    int x0 = (int)floorf(fu), y0 = (int)floorf(fv);
-    int ax = (int)((fu - x0) * 256.f), ay = (int)((fv - y0) * 256.f);   /* 8-bit fixed-point weights */
-    uint32_t c00 = texel(t, x0, y0), c10 = texel(t, x0 + 1, y0), c01 = texel(t, x0, y0 + 1), c11 = texel(t, x0 + 1, y0 + 1);
+    float flu = floorf(fu), flv = floorf(fv);
+    int x0 = (int)flu, y0 = (int)flv;
+    int ax = (int)((fu - flu) * 256.f), ay = (int)((fv - flv) * 256.f);   /* 8-bit fixed-point weights */
+    int xa, xb, ya, yb;
+    if (t->clamp_u) {
+        xa = x0 < 0 ? 0 : x0 >= t->w ? t->w - 1 : x0;
+        xb = x0 + 1 < 0 ? 0 : x0 + 1 >= t->w ? t->w - 1 : x0 + 1;
+    } else {
+        xa = x0 & (t->w - 1);
+        xb = (x0 + 1) & (t->w - 1);
+    }
+    if (t->clamp_v) {
+        ya = y0 < 0 ? 0 : y0 >= t->h ? t->h - 1 : y0;
+        yb = y0 + 1 < 0 ? 0 : y0 + 1 >= t->h ? t->h - 1 : y0 + 1;
+    } else {
+        ya = y0 & (t->h - 1);
+        yb = (y0 + 1) & (t->h - 1);
+    }
+    const uint32_t *r0 = t->px + ya * t->w, *r1 = t->px + yb * t->w;
+    uint32_t c00 = r0[xa], c10 = r0[xb], c01 = r1[xa], c11 = r1[xb];
+    /* Per channel: ((c00*(256-ax) + c10*ax)*(256-ay) + (c01*(256-ax) + c11*ax)*ay + 32768) >> 16,
+     * computed two channels at a time ("SIMD within a register"): R and B
+     * share one word, G and A another. The horizontal step fits 16-bit lanes
+     * (at most 255*256); the vertical step uses 32-bit lanes of a uint64. */
+    const uint32_t m = 0x00FF00FFu;
+    uint32_t iax = (uint32_t)(256 - ax), uax = (uint32_t)ax;
+    uint32_t top_rb = (c00 & m) * iax + (c10 & m) * uax, top_ga = ((c00 >> 8) & m) * iax + ((c10 >> 8) & m) * uax;
+    uint32_t bot_rb = (c01 & m) * iax + (c11 & m) * uax, bot_ga = ((c01 >> 8) & m) * iax + ((c11 >> 8) & m) * uax;
+#define SPREAD(w) ((uint64_t)((w) & 0xFFFFu) | ((uint64_t)((w) >> 16) << 32))
+    uint64_t iay = (uint64_t)(256 - ay), uay = (uint64_t)ay, round = 32768u | (32768ull << 32);
+    uint64_t rb = (SPREAD(top_rb) * iay + SPREAD(bot_rb) * uay + round) >> 16;
+    uint64_t ga = (SPREAD(top_ga) * iay + SPREAD(bot_ga) * uay + round) >> 16;
+#undef SPREAD
     Rgba r;
-#define LERP2(sh) (int)((((int)((c00 >> sh) & 255) * (256 - ax) + (int)((c10 >> sh) & 255) * ax) * (256 - ay) + \
-                         ((int)((c01 >> sh) & 255) * (256 - ax) + (int)((c11 >> sh) & 255) * ax) * ay + 32768) >> 16)
-    r.r = LERP2(0); r.g = LERP2(8); r.b = LERP2(16); r.a = LERP2(24);
-#undef LERP2
+    r.r = (int)(rb & 0xFFFF); r.b = (int)((rb >> 32) & 0xFFFF);
+    r.g = (int)(ga & 0xFFFF); r.a = (int)((ga >> 32) & 0xFFFF);
     return r;
 }
 
@@ -393,9 +433,10 @@ typedef struct {
     uint32_t write_mask;   /* bits that must NOT be written (packed ABGR8888) */
     int gouraud;
     Texture tex;
+    int fast_blend;   /* blend is src*a + dst*(1-a), added */
 } Pipe;
 
-static int compare(int func, int a, int b) {
+static inline __attribute__((always_inline)) int compare(int func, int a, int b) {
     switch (func) {
     case 0: return 0;
     case 1: return 1;
@@ -451,10 +492,20 @@ static Pipe setup_pipe(void) {
                            : (ge.cmd[GE_MASKRGB] & 0xFFFFFF) | ((ge.cmd[GE_MASKALPHA] & 0xFF) << 24);
     p.gouraud = ge.cmd[GE_SHADEMODE] & 1;
     if (p.textured) p.tex = current_texture();
+    if (g_scale > 1) {   /* draw into the high-resolution twins (surface.c) */
+        int n = g_scale, rows = p.sy2 + 1;
+        p.fb = surf_target(p.fb, p.fb_stride, p.fb_fmt, rows);
+        if (p.depth_test || p.z_write) p.zb = surf_target(p.zb, p.zb_stride, 4, rows);
+        p.fb_stride *= n;
+        p.zb_stride *= n;
+        p.sx1 *= n; p.sy1 *= n;
+        p.sx2 = (p.sx2 + 1) * n - 1; p.sy2 = (p.sy2 + 1) * n - 1;
+    }
+    p.fast_blend = p.blend && p.bl_a == 2 && p.bl_b == 3 && p.bl_eq == 0;
     return p;
 }
 
-static int stencil_op(int op, int cur, int ref) {
+static inline int stencil_op(int op, int cur, int ref) {
     switch (op) {
     case 0: return cur;
     case 1: return 0;
@@ -483,9 +534,10 @@ static int blend_factor(int which, int f, Rgba s, Rgba d, Rgba fix, int ch) {
 }
 
 static uint64_t g_bench_pixels;   /* MKU_RASTER_BENCH: pixels shaded in the serial replay */
+static int g_bench_skip;          /* MKU_BENCH_SKIP: 1 = no pixel shading, 2 = no texturing (timing experiments) */
 static int g_bench_counting;
 
-static void shade_pixel(const Pipe *p, int x, int y, float z, float u, float v, Rgba col) {
+static void shade_pixel_ref(const Pipe *p, int x, int y, float z, float u, float v, Rgba col) {
     if (x < p->sx1 || x > p->sx2 || y < p->sy1 || y > p->sy2) return;
     if (g_bench_counting) g_bench_pixels++;
     int bpp = p->fb_fmt == 3 ? 4 : 2;
@@ -584,6 +636,144 @@ write_stencil_only:
     }
 }
 
+/* The fast pixel pipeline: the same arithmetic as shade_pixel_ref() (which
+ * stays as the readable reference; MKU_RASTER_CHECK=1 compares the two on
+ * every batch), with the common cases taken out of the generic code: 32-bit
+ * framebuffers, src-alpha blending, no colour mask. */
+uint64_t g_fallback[3];   /* debug counters (unused now that the fast path covers everything) */
+uint32_t g_fallback_mask, g_fallback_blend;
+
+/* One blend factor for all three channels at once (same values as blend_factor()). */
+static inline void blend_factors(int which, int f, Rgba s, Rgba d, Rgba fix, int out[3]) {
+    const Rgba o = which == 0 ? d : s;   /* "the other colour" */
+    switch (f) {
+    case 0: out[0] = o.r; out[1] = o.g; out[2] = o.b; return;
+    case 1: out[0] = 255 - o.r; out[1] = 255 - o.g; out[2] = 255 - o.b; return;
+    case 2: out[0] = out[1] = out[2] = s.a; return;
+    case 3: out[0] = out[1] = out[2] = 255 - s.a; return;
+    case 4: out[0] = out[1] = out[2] = d.a; return;
+    case 5: out[0] = out[1] = out[2] = 255 - d.a; return;
+    case 6: out[0] = out[1] = out[2] = clamp255(2 * s.a); return;
+    case 7: out[0] = out[1] = out[2] = clamp255(255 - 2 * s.a); return;
+    case 8: out[0] = out[1] = out[2] = clamp255(2 * d.a); return;
+    case 9: out[0] = out[1] = out[2] = clamp255(255 - 2 * d.a); return;
+    default: out[0] = fix.r; out[1] = fix.g; out[2] = fix.b; return;
+    }
+}
+
+static inline int blend_eq(int eq, int sc, int dc, int sv, int dv) {
+    switch (eq) {
+    case 0: return sv + dv;
+    case 1: return sv - dv;
+    case 2: return dv - sv;
+    case 3: return sc < dc ? sc : dc;
+    case 4: return sc > dc ? sc : dc;
+    default: return abs(sc - dc);
+    }
+}
+
+/* The fast pixel pipeline: exactly the arithmetic of shade_pixel_ref() (which
+ * stays as the readable reference; MKU_RASTER_CHECK=1 compares the two on
+ * every batch), without its generic per-channel helpers, and with the common
+ * src-alpha blend and "no colour mask" cases taken out. */
+static inline __attribute__((always_inline)) void shade_pixel(const Pipe *p, int x, int y, float z, float u, float v, Rgba c) {
+    if (x < p->sx1 || x > p->sx2 || y < p->sy1 || y > p->sy2) return;
+    if (g_bench_counting) g_bench_pixels++;
+    int bpp = p->fb_fmt == 3 ? 4 : 2;
+    uint8_t *fp = rt_ptr(p->fb + (uint32_t)((y * p->fb_stride + x) * bpp));
+    uint8_t *zp = rt_ptr(p->zb + (uint32_t)((y * p->zb_stride + x) * 2));
+    int zi = (int)(z < 0 ? 0 : z > 65535 ? 65535 : z);
+
+    if (p->textured && g_bench_skip != 2) {
+        Rgba t = sample(&p->tex, u, v);
+        int mul = p->tex_double ? 2 : 1;
+        switch (p->tex_func) {
+        case 0:
+            c.r = c.r * t.r / 255; c.g = c.g * t.g / 255; c.b = c.b * t.b / 255;
+            if (p->tex_alpha) c.a = c.a * t.a / 255;
+            break;
+        case 1:
+            if (p->tex_alpha) {
+                c.r = (t.r * t.a + c.r * (255 - t.a)) / 255;
+                c.g = (t.g * t.a + c.g * (255 - t.a)) / 255;
+                c.b = (t.b * t.a + c.b * (255 - t.a)) / 255;
+            } else { c.r = t.r; c.g = t.g; c.b = t.b; }
+            break;
+        case 2:
+            c.r = (c.r * (255 - t.r) + p->env.r * t.r) / 255;
+            c.g = (c.g * (255 - t.g) + p->env.g * t.g) / 255;
+            c.b = (c.b * (255 - t.b) + p->env.b * t.b) / 255;
+            if (p->tex_alpha) c.a = c.a * t.a / 255;
+            break;
+        case 3:
+            c.r = t.r; c.g = t.g; c.b = t.b;
+            if (p->tex_alpha) c.a = t.a;
+            break;
+        default:
+            c.r += t.r; c.g += t.g; c.b += t.b;
+            if (p->tex_alpha) c.a = c.a * t.a / 255;
+            break;
+        }
+        c.r = clamp255(c.r * mul); c.g = clamp255(c.g * mul); c.b = clamp255(c.b * mul); c.a = clamp255(c.a);
+    }
+    if (p->alpha_test && !compare(p->at_func, c.a & p->at_mask, p->at_ref & p->at_mask)) return;
+
+    uint32_t raw;
+    if (bpp == 4) memcpy(&raw, fp, 4);
+    else { uint16_t h; memcpy(&h, fp, 2); raw = h; }
+    Rgba d = unpack(raw, p->fb_fmt);
+    int stencil = d.a, new_stencil = stencil;
+
+    if (p->stencil_test && !compare(p->st_func, p->st_ref & p->st_mask, stencil & p->st_mask)) {
+        new_stencil = stencil_op(p->op_sfail, stencil, p->st_ref);
+        goto stencil_only;
+    }
+    if (p->depth_test) {
+        uint16_t zd;
+        memcpy(&zd, zp, 2);
+        if (!compare(p->z_func, zi, zd)) {
+            if (p->stencil_test) new_stencil = stencil_op(p->op_zfail, stencil, p->st_ref);
+            goto stencil_only;
+        }
+    }
+    if (p->stencil_test) new_stencil = stencil_op(p->op_zpass, stencil, p->st_ref);
+    if (p->z_write) { uint16_t zw = (uint16_t)zi; memcpy(zp, &zw, 2); }
+
+    if (p->fast_blend) {   /* src * a + dst * (1 - a) */
+        int a = c.a, ia = 255 - a;
+        c.r = clamp255(c.r * a / 255 + d.r * ia / 255);
+        c.g = clamp255(c.g * a / 255 + d.g * ia / 255);
+        c.b = clamp255(c.b * a / 255 + d.b * ia / 255);
+    } else if (p->blend) {
+        int fa[3], fb[3];
+        blend_factors(0, p->bl_a, c, d, p->fix_a, fa);
+        blend_factors(1, p->bl_b, c, d, p->fix_b, fb);
+        int r = blend_eq(p->bl_eq, c.r, d.r, c.r * fa[0] / 255, d.r * fb[0] / 255);
+        int g = blend_eq(p->bl_eq, c.g, d.g, c.g * fa[1] / 255, d.g * fb[1] / 255);
+        int b = blend_eq(p->bl_eq, c.b, d.b, c.b * fa[2] / 255, d.b * fb[2] / 255);
+        c.r = clamp255(r); c.g = clamp255(g); c.b = clamp255(b);
+    }
+    if (p->stencil_test) c.a = new_stencil;   /* the alpha channel is the stencil buffer */
+    uint32_t out;
+    if (!p->write_mask) {
+        out = pack(c, p->fb_fmt);
+    } else {
+        uint32_t merged = (pack(c, 3) & ~p->write_mask) | (pack(d, 3) & p->write_mask);
+        out = pack(unpack(merged, 3), p->fb_fmt);
+    }
+    if (bpp == 4) memcpy(fp, &out, 4);
+    else { uint16_t h = (uint16_t)out; memcpy(fp, &h, 2); }
+    return;
+
+stencil_only:
+    if (p->stencil_test && new_stencil != stencil && !(p->write_mask & 0xFF000000u)) {
+        d.a = new_stencil;
+        uint32_t o = pack(d, p->fb_fmt);
+        if (bpp == 4) memcpy(fp, &o, 4);
+        else { uint16_t h = (uint16_t)o; memcpy(fp, &h, 2); }
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* rasterisation */
 
@@ -591,7 +781,13 @@ static float edge(float ax, float ay, float bx, float by, float px, float py) {
     return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
 }
 
-static void draw_triangle(const Pipe *p, const Vert *a, const Vert *b, const Vert *c, const Vert *flat, int ry0, int ry1) {
+/* Triangles, with every attribute as a plane equation over the screen:
+ * S(x, y) = S(row start) + dS/dx * steps, one add per attribute per pixel.
+ * With perspective, u/w, v/w, colour/w and 1/w are the linear quantities and
+ * each pixel divides once. Each row starts from an exact evaluation, so a
+ * row's pixels don't depend on which band drew it (MKU_RASTER_CHECK), and
+ * each row only walks the span where all three edge functions can be >= 0. */
+static inline void draw_triangle(const Pipe *p, const Vert *a, const Vert *b, const Vert *c, const Vert *flat, int ry0, int ry1, int ref) {
     float area = edge(a->x, a->y, b->x, b->y, c->x, c->y);
     if (area == 0.f) return;
     float inv = 1.f / area;
@@ -605,41 +801,82 @@ static void draw_triangle(const Pipe *p, const Vert *a, const Vert *b, const Ver
     if (y0 < ry0) y0 = ry0;   /* only this worker's rows */
     if (y1 > ry1) y1 = ry1;
     if (x0 >= x1 || y0 >= y1) return;
-    /* barycentric weights are linear in x and y: step them instead of recomputing */
-    /* Each row starts from an exact edge evaluation (so a row's pixels don't
-     * depend on which band drew it), then steps along x. */
+
     float px0 = x0 + 0.5f;
-    float w0_dx = (b->y - c->y) * inv, w1_dx = (c->y - a->y) * inv;
+    float w0_dx = (b->y - c->y) * inv, w1_dx = (c->y - a->y) * inv, w2_dx = -w0_dx - w1_dx;
     int perspective = !(a->w == b->w && b->w == c->w);
+    int gouraud = p->gouraud;
     Rgba fc = {(int)flat->r, (int)flat->g, (int)flat->b, (int)flat->a};
+
+    /* per-vertex values of the interpolated quantities: [0]=q (1/w), then
+     * u, v, r, g, b, a (each times q when perspective-correct), [7]=z */
+    enum { Q, U, V, R, G, B, A, Z, NATTR };
+    float va[3][NATTR];
+    const Vert *vs[3] = {a, b, c};
+    for (int i = 0; i < 3; i++) {
+        const Vert *t = vs[i];
+        float q = perspective ? t->w : 1.f;
+        va[i][Q] = q;
+        va[i][U] = t->u * q; va[i][V] = t->v * q;
+        va[i][R] = t->r * q; va[i][G] = t->g * q; va[i][B] = t->b * q; va[i][A] = t->a * q;
+        va[i][Z] = t->z;
+    }
+    float d0[NATTR], d1[NATTR], ddx[NATTR];   /* S = s2 + w0*d0 + w1*d1 */
+    for (int k = 0; k < NATTR; k++) {
+        d0[k] = va[0][k] - va[2][k];
+        d1[k] = va[1][k] - va[2][k];
+        ddx[k] = d0[k] * w0_dx + d1[k] * w1_dx;
+    }
+    int nattr = gouraud ? NATTR : A + 1;   /* colours only matter when gouraud */
+
     for (int y = y0; y < y1; y++) {
         float py = y + 0.5f;
-        float w0 = edge(b->x, b->y, c->x, c->y, px0, py) * inv, w1 = edge(c->x, c->y, a->x, a->y, px0, py) * inv;
-        for (int x = x0; x < x1; x++, w0 += w0_dx, w1 += w1_dx) {
+        float w0r = edge(b->x, b->y, c->x, c->y, px0, py) * inv, w1r = edge(c->x, c->y, a->x, a->y, px0, py) * inv;
+        float w2r = 1.f - w0r - w1r;
+        /* the span where every edge function is >= 0 (with a pixel of margin) */
+        float lo = 0.f, hi = (float)(x1 - x0 - 1);
+        const float wr[3] = {w0r, w1r, w2r}, wd[3] = {w0_dx, w1_dx, w2_dx};
+        int empty = 0;
+        for (int e = 0; e < 3; e++) {
+            if (wd[e] > 0.f) { float t = -wr[e] / wd[e]; if (t - 1.f > lo) lo = t - 1.f; }
+            else if (wd[e] < 0.f) { float t = wr[e] / -wd[e]; if (t + 1.f < hi) hi = t + 1.f; }
+            else if (wr[e] < 0.f) empty = 1;
+        }
+        if (empty || lo > hi) continue;
+        int xs = (int)lo, xe = (int)hi;
+        if (xs < 0) xs = 0;
+        if (xe > x1 - x0 - 1) xe = x1 - x0 - 1;
+        float fs = (float)xs;
+        float w0 = w0r + w0_dx * fs, w1 = w1r + w1_dx * fs;
+        float at[NATTR];
+        for (int k = 0; k < NATTR; k++) at[k] = va[2][k] + w0 * d0[k] + w1 * d1[k];
+        for (int x = x0 + xs; x <= x0 + xe; x++) {
             float w2 = 1.f - w0 - w1;
-            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
-            float k0 = w0, k1 = w1, k2 = w2;
-            if (perspective) {   /* interpolate attribute/w and 1/w */
-                float iw = 1.f / (w0 * a->w + w1 * b->w + w2 * c->w);
-                k0 = w0 * a->w * iw; k1 = w1 * b->w * iw; k2 = w2 * c->w * iw;
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+                float iw = perspective ? 1.f / at[Q] : 1.f;
+                Rgba col = fc;
+                if (gouraud) {
+                    col.r = (int)(at[R] * iw + 0.5f);
+                    col.g = (int)(at[G] * iw + 0.5f);
+                    col.b = (int)(at[B] * iw + 0.5f);
+                    col.a = (int)(at[A] * iw + 0.5f);
+                }
+                float u = at[U] * iw, v = at[V] * iw;
+                if (ref) shade_pixel_ref(p, x, y, at[Z], u, v, col);
+                else if (g_bench_skip == 1) g_bench_pixels += (int)u ^ col.r;
+                else shade_pixel(p, x, y, at[Z], u, v, col);
             }
-            float z = w0 * a->z + w1 * b->z + w2 * c->z;
-            float u = k0 * a->u + k1 * b->u + k2 * c->u, v = k0 * a->v + k1 * b->v + k2 * c->v;
-            Rgba col = fc;
-            if (p->gouraud) {
-                col.r = (int)(k0 * a->r + k1 * b->r + k2 * c->r + 0.5f);
-                col.g = (int)(k0 * a->g + k1 * b->g + k2 * c->g + 0.5f);
-                col.b = (int)(k0 * a->b + k1 * b->b + k2 * c->b + 0.5f);
-                col.a = (int)(k0 * a->a + k1 * b->a + k2 * c->a + 0.5f);
-            }
-            shade_pixel(p, x, y, z, u, v, col);
+            w0 += w0_dx;
+            w1 += w1_dx;
+            for (int k = 0; k < nattr; k++) at[k] += ddx[k];
+            if (!gouraud) at[Z] += ddx[Z];
         }
     }
 }
 
 /* Sprites: axis-aligned rectangles from two corners; colour and depth come
  * from the second vertex, texture coordinates are interpolated linearly. */
-static void draw_sprite(const Pipe *p, const Vert *a, const Vert *b, int ry0, int ry1) {
+static inline void draw_sprite(const Pipe *p, const Vert *a, const Vert *b, int ry0, int ry1, int ref) {
     int x0 = (int)floorf(fminf(a->x, b->x)), x1 = (int)floorf(fmaxf(a->x, b->x));
     int y0 = (int)floorf(fminf(a->y, b->y)), y1 = (int)floorf(fmaxf(a->y, b->y));
     float dx = b->x - a->x, dy = b->y - a->y;
@@ -651,7 +888,8 @@ static void draw_sprite(const Pipe *p, const Vert *a, const Vert *b, int ry0, in
         float v = a->v + (b->v - a->v) * ty;
         for (int x = x0 < p->sx1 ? p->sx1 : x0; x < x1 && x <= p->sx2; x++) {
             float tx = dx != 0.f ? ((x + 0.5f) - a->x) / dx : 0.f;
-            shade_pixel(p, x, y, b->z, a->u + (b->u - a->u) * tx, v, col);
+            float uu = a->u + (b->u - a->u) * tx;
+            if (ref) shade_pixel_ref(p, x, y, b->z, uu, v, col); else shade_pixel(p, x, y, b->z, uu, v, col);
         }
     }
 }
@@ -675,12 +913,13 @@ static void draw_sprite(const Pipe *p, const Vert *a, const Vert *b, int ry0, in
 #include <stdatomic.h>
 #include <unistd.h>
 
-#define BAND 16
+#define BAND 8           /* rows per band */
+#define MAX_BANDS 1024
 
 typedef struct {
     Vert a, b, c;
     int pipe, sprite;
-    int y0, y1;   /* rows covered (for skipping) */
+    int y0, y1;   /* rows covered, inclusive */
 } Job;
 
 static Job *g_jobs;
@@ -689,33 +928,66 @@ static Pipe *g_pipes;
 static int g_npipes, g_cap_pipes;
 static uint32_t g_batch_fb = 0xFFFFFFFFu, g_batch_zb;
 static int g_batch_ymax;
+static uint64_t g_batch_area;   /* sum of bounding-box areas: is the batch worth the threads? */
+
+/* Binning: for each band, the jobs that touch it, in submission order
+ * (a counting sort, so each band walks only its own jobs). */
+static int *g_bin_jobs, g_cap_bin;
+static int g_bin_start[MAX_BANDS + 1];
+
+static void bin_jobs(void) {
+    int nb = (g_batch_ymax + BAND) / BAND;
+    if (nb > MAX_BANDS) nb = MAX_BANDS;
+    static int count[MAX_BANDS];
+    memset(count, 0, sizeof(int) * (size_t)nb);
+    int total = 0;
+    for (int i = 0; i < g_njobs; i++) {
+        int b0 = g_jobs[i].y0 / BAND, b1 = g_jobs[i].y1 / BAND;
+        if (b1 >= nb) b1 = nb - 1;
+        for (int b = b0; b <= b1; b++) count[b]++;
+        total += b1 - b0 + 1;
+    }
+    if (total > g_cap_bin) {
+        g_cap_bin = total * 2;
+        g_bin_jobs = realloc(g_bin_jobs, sizeof(int) * (size_t)g_cap_bin);
+    }
+    g_bin_start[0] = 0;
+    for (int b = 0; b < nb; b++) g_bin_start[b + 1] = g_bin_start[b] + count[b];
+    memcpy(count, g_bin_start, sizeof(int) * (size_t)nb);   /* reuse as fill cursors */
+    for (int i = 0; i < g_njobs; i++) {
+        int b0 = g_jobs[i].y0 / BAND, b1 = g_jobs[i].y1 / BAND;
+        if (b1 >= nb) b1 = nb - 1;
+        for (int b = b0; b <= b1; b++) g_bin_jobs[count[b]++] = i;
+    }
+}
 
 static int g_nthreads;
 static pthread_t g_workers[16];
 static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_pool_go = PTHREAD_COND_INITIALIZER, g_pool_done = PTHREAD_COND_INITIALIZER;
-static uint64_t g_pool_gen;
-static int g_pool_busy;
+static pthread_cond_t g_pool_go = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_pool_gen;
+static atomic_int g_pool_busy;
 static atomic_int g_next_band;
 static int g_nbands;
 
 static void draw_band(int band) {
     int ry0 = band * BAND, ry1 = ry0 + BAND;
-    for (int i = 0; i < g_njobs; i++) {
-        const Job *j = &g_jobs[i];
-        if (j->y1 < ry0 || j->y0 >= ry1) continue;
+    for (int k = g_bin_start[band]; k < g_bin_start[band + 1]; k++) {
+        const Job *j = &g_jobs[g_bin_jobs[k]];
         const Pipe *p = &g_pipes[j->pipe];
-        if (j->sprite) draw_sprite(p, &j->a, &j->b, ry0, ry1);
-        else draw_triangle(p, &j->a, &j->b, &j->c, &j->c, ry0, ry1);
+        if (j->sprite) draw_sprite(p, &j->a, &j->b, ry0, ry1, 0);
+        else draw_triangle(p, &j->a, &j->b, &j->c, &j->c, ry0, ry1, 0);
     }
 }
 
-static void draw_unbanded(void) {   /* reference: the plain serial renderer */
+/* Serial, no bands. ref=1: with the reference pixel pipeline (the oracle for
+ * MKU_RASTER_CHECK); ref=0: the fast one (MKU_RASTER_BENCH). */
+static void draw_unbanded(int ref) {
     for (int i = 0; i < g_njobs; i++) {
         const Job *j = &g_jobs[i];
         const Pipe *p = &g_pipes[j->pipe];
-        if (j->sprite) draw_sprite(p, &j->a, &j->b, 0, 1 << 20);
-        else draw_triangle(p, &j->a, &j->b, &j->c, &j->c, 0, 1 << 20);
+        if (j->sprite) draw_sprite(p, &j->a, &j->b, 0, 1 << 20, ref);
+        else draw_triangle(p, &j->a, &j->b, &j->c, &j->c, 0, 1 << 20, ref);
     }
 }
 
@@ -724,18 +996,34 @@ static void take_bands(void) {
     while ((b = atomic_fetch_add(&g_next_band, 1)) < g_nbands) draw_band(b);
 }
 
+static inline void cpu_relax(void) {
+#if defined(__aarch64__)
+    __asm__ volatile("yield");
+#elif defined(__x86_64__)
+    __asm__ volatile("pause");
+#endif
+}
+
+/* Workers spin for a moment after each batch (batches come in bursts within
+ * a frame, and waking a sleeping thread costs tens of microseconds), then
+ * sleep until the next frame. */
+static int g_spin_limit = 4000;
+
 static void *worker(void *arg) {
     (void)arg;
     uint64_t seen = 0;
     for (;;) {
-        pthread_mutex_lock(&g_pool_lock);
-        while (g_pool_gen == seen) pthread_cond_wait(&g_pool_go, &g_pool_lock);
-        seen = g_pool_gen;
-        pthread_mutex_unlock(&g_pool_lock);
+        uint64_t g;
+        int spins = 0;
+        while ((g = atomic_load(&g_pool_gen)) == seen) {
+            if (++spins < g_spin_limit) { cpu_relax(); continue; }
+            pthread_mutex_lock(&g_pool_lock);
+            while (atomic_load(&g_pool_gen) == seen) pthread_cond_wait(&g_pool_go, &g_pool_lock);
+            pthread_mutex_unlock(&g_pool_lock);
+        }
+        seen = g;
         take_bands();
-        pthread_mutex_lock(&g_pool_lock);
-        if (--g_pool_busy == 0) pthread_cond_signal(&g_pool_done);
-        pthread_mutex_unlock(&g_pool_lock);
+        atomic_fetch_sub(&g_pool_busy, 1);
     }
     return NULL;
 }
@@ -746,43 +1034,45 @@ static void pool_init(void) {
     if (n < 1) n = 1;
     if (n > 16) n = 16;
     g_nthreads = (int)n;
+    if (getenv("MKU_RASTER_SPIN")) g_spin_limit = atoi(getenv("MKU_RASTER_SPIN"));
     for (int i = 0; i < g_nthreads - 1; i++) pthread_create(&g_workers[i], NULL, worker, NULL);
 }
 
-static int g_check_force;   /* unused unless debugging the pool */
+#define PARALLEL_MIN_AREA 8192   /* pixels of bounding boxes below which one thread is faster */
 
 static void run_batch(int threads) {
+    bin_jobs();
     g_nbands = (g_batch_ymax + BAND) / BAND;
+    if (g_nbands > MAX_BANDS) g_nbands = MAX_BANDS;
     atomic_store(&g_next_band, 0);
-    if (threads <= 1 || g_njobs < 8 || g_check_force) {
+    if (threads <= 1 || g_batch_area < PARALLEL_MIN_AREA) {
         take_bands();
         return;
     }
+    atomic_store(&g_pool_busy, threads - 1);
+    atomic_fetch_add(&g_pool_gen, 1);
     pthread_mutex_lock(&g_pool_lock);
-    g_pool_busy = threads - 1;
-    g_pool_gen++;
     pthread_cond_broadcast(&g_pool_go);
     pthread_mutex_unlock(&g_pool_lock);
     take_bands();   /* the calling thread works too */
-    pthread_mutex_lock(&g_pool_lock);
-    while (g_pool_busy) pthread_cond_wait(&g_pool_done, &g_pool_lock);
-    pthread_mutex_unlock(&g_pool_lock);
+    while (atomic_load(&g_pool_busy)) cpu_relax();
 }
 
 /* MKU_RASTER_BENCH=1: after drawing each batch for real, replay it on one
  * thread (on a saved copy of VRAM) and time it: the renderer's own cost,
  * independent of thread scheduling. Reported every 300 frames. */
 static int g_bench = -1;
-static uint64_t g_bench_us, g_bench_jobs;
+static uint64_t g_bench_us, g_bench_jobs, g_bench_par_us, g_bench_batches;
 static uint8_t g_bench_vram[VRAM_SIZE];
 
 void raster_bench_report(void) {
     static unsigned frames;
     if (g_bench != 1 || ++frames % 300) return;
-    fprintf(stderr, "[bench] serial raster: %.2f ms/frame, %.1f ns/pixel, %.0f pixels/frame, %.0f prims/frame\n",
+    fprintf(stderr, "[bench] serial raster: %.2f ms/frame, %.1f ns/pixel, %.0f pixels/frame, %.0f prims/frame; "
+            "parallel (%d threads): %.2f ms/frame, %.1f batches/frame\n",
             g_bench_us / 1000.0 / 300, g_bench_pixels ? g_bench_us * 1000.0 / g_bench_pixels : 0.0,
-            g_bench_pixels / 300.0, g_bench_jobs / 300.0);
-    g_bench_us = g_bench_pixels = g_bench_jobs = 0;
+            g_bench_pixels / 300.0, g_bench_jobs / 300.0, g_nthreads, g_bench_par_us / 1000.0 / 300, g_bench_batches / 300.0);
+    g_bench_us = g_bench_pixels = g_bench_jobs = g_bench_par_us = g_bench_batches = 0;
 }
 
 static void bench_batch(void) {
@@ -795,7 +1085,8 @@ static void bench_replay(void) {
     memcpy(rt_ptr(VRAM_BASE), g_bench_vram, VRAM_SIZE);
     g_bench_counting = 1;
     uint64_t t0 = now_us();
-    draw_unbanded();
+    draw_unbanded(0);
+    if (g_bench_skip == 1) g_bench_pixels = 0;
     g_bench_us += now_us() - t0;
     g_bench_counting = 0;
     g_bench_jobs += (uint64_t)g_njobs;
@@ -805,16 +1096,20 @@ static void bench_replay(void) {
 void gpu_flush(void) {
     if (!g_njobs) return;
     if (!g_nthreads) pool_init();
-    if (g_bench < 0) g_bench = getenv("MKU_RASTER_BENCH") != NULL;
+    if (g_bench < 0) {
+        g_bench = getenv("MKU_RASTER_BENCH") != NULL;
+        g_bench_skip = getenv("MKU_BENCH_SKIP") ? atoi(getenv("MKU_BENCH_SKIP")) : 0;
+    }
+    if (g_bench && g_scale > 1) g_bench = 0;   /* bench copies VRAM only: 1x */
     if (g_bench) bench_batch();
     uint64_t t0 = now_us();
     static int check = -1;
     if (check < 0) check = getenv("MKU_RASTER_CHECK") != NULL;
-    if (check) {   /* differential test: unbanded serial vs banded parallel on the same input */
+    if (check && g_scale == 1) {   /* differential test: unbanded serial vs banded parallel on the same input */
         static uint8_t before[VRAM_SIZE], serial[VRAM_SIZE];
         static unsigned batches, bad;
         memcpy(before, rt_ptr(VRAM_BASE), VRAM_SIZE);
-        draw_unbanded();
+        draw_unbanded(1);
         memcpy(serial, rt_ptr(VRAM_BASE), VRAM_SIZE);
         memcpy(rt_ptr(VRAM_BASE), before, VRAM_SIZE);
         run_batch(g_nthreads);
@@ -822,7 +1117,7 @@ void gpu_flush(void) {
         if (memcmp(serial, rt_ptr(VRAM_BASE), VRAM_SIZE)) {
             size_t k = 0;
             while (serial[k] == ((uint8_t *)rt_ptr(VRAM_BASE))[k]) k++;
-            fprintf(stderr, "[raster-check] batch %u (%d prims): parallel differs from serial at VRAM+0x%zX\n", batches, g_njobs, k);
+            fprintf(stderr, "[raster-check] batch %u (%d prims): fast parallel renderer differs from the reference at VRAM+0x%zX\n", batches, g_njobs, k);
             bad++;
         } else if (batches % 2000 == 0) {
             fprintf(stderr, "[raster-check] %u batches identical, %u different\n", batches, bad);
@@ -830,10 +1125,11 @@ void gpu_flush(void) {
     } else {
         run_batch(g_nthreads);
     }
-    if (g_bench) bench_replay();
+    if (g_bench) { g_bench_par_us += now_us() - t0; g_bench_batches++; bench_replay(); }
     g_njobs = 0;
     g_npipes = 0;
     g_batch_ymax = 0;
+    g_batch_area = 0;
     g_batch_fb = 0xFFFFFFFFu;
     if (!g_bench) g_raster_us += now_us() - t0;
 }
@@ -851,8 +1147,16 @@ static int queue_pipe(const Pipe *p) {
     return g_npipes++;
 }
 
-static void queue_job(int pipe, const Vert *a, const Vert *b, const Vert *c, int sprite) {
+static void queue_job(int pipe, const Vert *a0, const Vert *b0, const Vert *c0, int sprite) {
     const Pipe *p = &g_pipes[pipe];
+    Vert sa = *a0, sb = *b0, sc;
+    if (!sprite) sc = *c0;
+    if (g_scale > 1) {   /* screen coordinates of the high-resolution twin */
+        float n = (float)g_scale;
+        sa.x *= n; sa.y *= n; sb.x *= n; sb.y *= n;
+        if (!sprite) { sc.x *= n; sc.y *= n; }
+    }
+    const Vert *a = &sa, *b = &sb, *c = sprite ? NULL : &sc;
     float ylo = sprite ? fminf(a->y, b->y) : fminf(a->y, fminf(b->y, c->y));
     float yhi = sprite ? fmaxf(a->y, b->y) : fmaxf(a->y, fmaxf(b->y, c->y));
     int y0 = (int)floorf(ylo), y1 = (int)ceilf(yhi);
@@ -873,6 +1177,15 @@ static void queue_job(int pipe, const Vert *a, const Vert *b, const Vert *c, int
     j->y0 = y0;
     j->y1 = y1;
     if (y1 > g_batch_ymax) g_batch_ymax = y1;
+    {
+        float xlo = sprite ? fminf(a->x, b->x) : fminf(a->x, fminf(b->x, c->x));
+        float xhi = sprite ? fmaxf(a->x, b->x) : fmaxf(a->x, fmaxf(b->x, c->x));
+        if (xlo < (float)p->sx1) xlo = (float)p->sx1;
+        if (xhi > (float)p->sx2) xhi = (float)p->sx2;
+        uint64_t area = xhi >= xlo ? (uint64_t)((xhi - xlo + 1.f) * (float)(y1 - y0 + 1)) : 0;
+        g_batch_area += area;
+        g_area_kind[p->clear ? 0 : sprite ? 1 : 2] += area;
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1051,8 +1364,8 @@ static void draw_prim_impl(uint32_t data) {
         float zmin = 1e9f, zmax = -1e9f;
         int vis = 0;
         for (int i = 0; i < count; i++) if (ok[i]) { vis++; zmin = fminf(zmin, g_verts[i].z); zmax = fmaxf(zmax, g_verts[i].z); }
-        fprintf(stderr, "[draw] type=%d n=%d vis=%d vt=%06X %s fb=%08X tex=%s%08X fmt=%d %dx%d func=%d at=%d/%d,%d zt=%d/%d zw=%d bl=%d(%X,%X,%d) st=%d mask=%08X z=%.0f..%.0f x0=%.0f y0=%.0f\n",
-                type, count, vis, vt, f.through ? "2D" : "3D", p.fb, p.textured ? "" : "-", p.textured ? p.tex.addr : 0,
+        fprintf(stderr, "[draw] fbfmt=%d type=%d n=%d vis=%d vt=%06X %s fb=%08X tex=%s%08X fmt=%d %dx%d func=%d at=%d/%d,%d zt=%d/%d zw=%d bl=%d(%X,%X,%d) st=%d mask=%08X z=%.0f..%.0f x0=%.0f y0=%.0f\n",
+                p.fb_fmt, type, count, vis, vt, f.through ? "2D" : "3D", p.fb, p.textured ? "" : "-", p.textured ? p.tex.addr : 0,
                 p.tex.fmt, p.tex.w, p.tex.h, p.tex_func, p.alpha_test, p.at_func, p.at_ref, p.depth_test, p.z_func, p.z_write,
                 p.blend, p.bl_a, p.bl_b, p.bl_eq, p.stencil_test, p.write_mask, zmin, zmax, g_verts[0].x, g_verts[0].y);
     }
@@ -1093,6 +1406,7 @@ void gpu_load_clut(void) { load_clut(); }
 /* TRANSFERSTART: copy a rectangle of pixels (e.g. RAM -> VRAM). */
 void gpu_block_transfer(uint32_t data) {
     gpu_flush();
+    surf_writeback(0x04000000u, VRAM_SIZE);   /* rare: bring all of VRAM up to date */
     g_transfers++;
     uint32_t src = (ge.cmd[GE_TRANSFERSRC] & 0xFFFFF0) | ((ge.cmd[GE_TRANSFERSRCW] & 0xFF0000) << 8);
     uint32_t dst = (ge.cmd[GE_TRANSFERDST] & 0xFFFFF0) | ((ge.cmd[GE_TRANSFERDSTW] & 0xFF0000) << 8);

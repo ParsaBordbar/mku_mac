@@ -5,7 +5,7 @@
 
 void host_init(void);                       /* main thread, before the game starts */
 void host_run(void);                        /* main thread, never returns */
-void host_submit_frame(const uint32_t *rgba);   /* game thread: a finished 480x272 frame */
+void host_submit_frame(const uint32_t *rgba, int w, int h);   /* game thread: a finished frame (480x272 x scale) */
 uint32_t host_buttons(void);                /* PSP button bits currently held */
 uint32_t host_analog(void);                 /* lx | ly << 8, 128 = centre */
 void host_camera(float *yaw, float *pitch, float *zoom);   /* free camera (right stick) */

@@ -12,43 +12,56 @@
 #define SCREEN_W 480
 #define SCREEN_H 272
 
-/* RGBA8888 (R in the lowest byte) of what the game asked to display. */
-int present_capture(uint32_t *out) {
+/* RGBA8888 (R in the lowest byte) of what the game asked to display, at the
+ * rendering resolution (480x272 times MKU_SCALE). */
+int present_capture(uint32_t *out, int *ow, int *oh) {
     uint32_t addr, stride, fmt;
     display_framebuffer(&addr, &stride, &fmt);
     if (!addr || !stride) return 0;
-    for (int y = 0; y < SCREEN_H; y++) {
-        for (int x = 0; x < SCREEN_W; x++) {
-            uint32_t p, r, g, b;
-            if (fmt == 3) {
-                p = MEM_LW(addr + (uint32_t)((y * (int)stride + x) * 4));
-                r = p & 255; g = (p >> 8) & 255; b = (p >> 16) & 255;
-            } else {
-                p = MEM_LHU(addr + (uint32_t)((y * (int)stride + x) * 2));
-                if (fmt == 0) { r = (p & 31) * 255 / 31; g = ((p >> 5) & 63) * 255 / 63; b = ((p >> 11) & 31) * 255 / 31; }
-                else if (fmt == 1) { r = (p & 31) * 255 / 31; g = ((p >> 5) & 31) * 255 / 31; b = ((p >> 10) & 31) * 255 / 31; }
-                else { r = (p & 15) * 17; g = ((p >> 4) & 15) * 17; b = ((p >> 8) & 15) * 17; }
-            }
-            out[y * SCREEN_W + x] = r | (g << 8) | (b << 16) | 0xFF000000u;   /* displayed alpha is ignored */
+    int n = 1;
+    uint32_t hi = surf_display((addr & 0x0FFFFFFFu) | 0x04000000u, (int)stride, (int)fmt);
+    if (hi) { addr = hi; stride *= (uint32_t)g_scale; n = g_scale; }
+    int W = SCREEN_W * n, H = SCREEN_H * n;
+    *ow = W; *oh = H;
+    /* 5/6/4-bit -> 8-bit expansion tables (same values as v * 255 / 31 etc.) */
+    static uint8_t e5[32], e6[64];
+    if (!e6[63]) {
+        for (int i = 0; i < 32; i++) e5[i] = (uint8_t)(i * 255 / 31);
+        for (int i = 0; i < 64; i++) e6[i] = (uint8_t)(i * 255 / 63);
+    }
+    for (int y = 0; y < H; y++) {
+        uint32_t *o = out + y * W;
+        if (fmt == 3) {
+            const uint32_t *row = (const uint32_t *)rt_ptr(addr + (uint32_t)(y * (int)stride * 4));
+            for (int x = 0; x < W; x++) o[x] = row[x] | 0xFF000000u;   /* displayed alpha is ignored */
+            continue;
+        }
+        const uint16_t *row = (const uint16_t *)rt_ptr(addr + (uint32_t)(y * (int)stride * 2));
+        for (int x = 0; x < W; x++) {
+            uint32_t p = row[x], r, g, b;
+            if (fmt == 0) { r = e5[p & 31]; g = e6[(p >> 5) & 63]; b = e5[(p >> 11) & 31]; }
+            else if (fmt == 1) { r = e5[p & 31]; g = e5[(p >> 5) & 31]; b = e5[(p >> 10) & 31]; }
+            else { r = (p & 15) * 17; g = ((p >> 4) & 15) * 17; b = ((p >> 8) & 15) * 17; }
+            o[x] = r | (g << 8) | (b << 16) | 0xFF000000u;
         }
     }
     return 1;
 }
 
-static void write_bmp(const char *path, const uint32_t *px) {
+static void write_bmp(const char *path, const uint32_t *px, int W, int H) {
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return; }
-    uint32_t row = SCREEN_W * 3, size = 54 + row * SCREEN_H;
+    uint32_t row = (uint32_t)W * 3, size = 54 + row * (uint32_t)H;
     uint8_t h[54] = {'B', 'M'};
     memcpy(h + 2, &size, 4);
     h[10] = 54; h[14] = 40;
-    int32_t w = SCREEN_W, hh = SCREEN_H;
+    int32_t w = W, hh = H;
     memcpy(h + 18, &w, 4); memcpy(h + 22, &hh, 4);
     h[26] = 1; h[28] = 24;
     fwrite(h, 1, 54, f);
-    for (int y = SCREEN_H - 1; y >= 0; y--)   /* BMP rows go bottom-up, BGR */
-        for (int x = 0; x < SCREEN_W; x++) {
-            uint32_t p = px[y * SCREEN_W + x];
+    for (int y = H - 1; y >= 0; y--)   /* BMP rows go bottom-up, BGR */
+        for (int x = 0; x < W; x++) {
+            uint32_t p = px[y * W + x];
             uint8_t bgr[3] = {(uint8_t)(p >> 16), (uint8_t)(p >> 8), (uint8_t)p};
             fwrite(bgr, 1, 3, f);
         }
@@ -83,7 +96,13 @@ static void fps_stats(void) {
             fprintf(stderr, "[fps] %llu fps, slowest frame %.1f ms, rendering %.1f ms/frame (%.0f%% of a 16.7 ms frame)\n",
                     (unsigned long long)frames, worst / 1000.0, (g_raster_us - raster_at_start) / 1000.0 / frames,
                     100.0 * (g_raster_us - raster_at_start) / frames / 16683.0);
-        static uint64_t q0, c0, d0;
+        static uint64_t q0, c0, d0, k0[3];
+        extern uint64_t g_area_kind[3];
+        if (window_start && frames)
+            fprintf(stderr, "[fps]   bbox pixels per frame: clear %llu, sprites %llu, triangles %llu\n",
+                    (unsigned long long)((g_area_kind[0] - k0[0]) / frames), (unsigned long long)((g_area_kind[1] - k0[1]) / frames),
+                    (unsigned long long)((g_area_kind[2] - k0[2]) / frames));
+        memcpy(k0, g_area_kind, sizeof k0);
         if (window_start && frames)
             fprintf(stderr, "[fps]   per frame: %llu 3D draws, %llu prims queued, %llu vertices behind the camera\n",
                     (unsigned long long)((g_draws_3d - d0) / frames), (unsigned long long)((g_tris_queued - q0) / frames),
@@ -107,8 +126,10 @@ void present_frame_shown(uint64_t frame) {
     gpu_texture_flush();   /* re-validate textures at least once per frame */
     gpu_frame_end();
     raster_bench_report();
-    static uint32_t rgba[SCREEN_W * SCREEN_H];
-    if (present_capture(rgba)) host_submit_frame(rgba);
+    surf_frame_end();
+    static uint32_t rgba[SCREEN_W * SCREEN_H * 16];
+    int fw = SCREEN_W, fh = SCREEN_H;
+    if (present_capture(rgba, &fw, &fh)) host_submit_frame(rgba, fw, fh);
     static const char *shots = (const char *)-1;
     if (shots == (const char *)-1) shots = getenv("MKU_SHOTS");
     if (!shots) return;
@@ -122,7 +143,7 @@ void present_frame_shown(uint64_t frame) {
                 char path[64];
                 mkdir("build/shots", 0755);
                 snprintf(path, sizeof path, "build/shots/frame_%05llu.bmp", (unsigned long long)frame);
-                write_bmp(path, px);
+                write_bmp(path, px, fw, fh);
                 fprintf(stderr, "[shot] %s at %.2f s\n", path, now_us() / 1e6);
             }
         }

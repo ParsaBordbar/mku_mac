@@ -29,8 +29,9 @@ static SDL_Renderer *g_renderer;
 static SDL_Texture *g_texture;
 
 static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t g_frame[W * H];
-static int g_frame_new;
+#define MAX_FRAME (W * H * 16)   /* up to 4x rendering resolution */
+static uint32_t g_frame[MAX_FRAME];
+static int g_frame_w = W, g_frame_h = H, g_frame_new;
 
 static _Atomic uint32_t g_buttons;
 static _Atomic uint32_t g_analog = 0x8080;   /* lx | ly << 8 */
@@ -46,9 +47,9 @@ void host_init(void) {
                                 W * 2, H * 2, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     SDL_RenderSetLogicalSize(g_renderer, W, H);   /* keeps 480:272 with black bars */
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
-    /* ABGR8888 = bytes R,G,B,A in memory on little-endian: the PSP's own layout. */
-    g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, W, H);
+    /* Smooth scaling to the window (MKU_SHARP=1: nearest neighbour, the raw pixels).
+     * The texture is (re)created at the rendering resolution on the first frame. */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, getenv("MKU_SHARP") ? "0" : "1");
     g_headless = 0;
     host_audio_init();
     fprintf(stderr, "[host] window open. Keys: arrows=d-pad, Enter=START, RShift=SELECT, "
@@ -56,10 +57,12 @@ void host_init(void) {
 }
 
 /* Game thread: a complete frame is ready (called from sceDisplaySetFrameBuf). */
-void host_submit_frame(const uint32_t *rgba) {
-    if (g_headless) return;
+void host_submit_frame(const uint32_t *rgba, int w, int h) {
+    if (g_headless || w * h > MAX_FRAME) return;
     pthread_mutex_lock(&g_frame_lock);
-    memcpy(g_frame, rgba, sizeof g_frame);
+    memcpy(g_frame, rgba, sizeof(uint32_t) * (size_t)(w * h));
+    g_frame_w = w;
+    g_frame_h = h;
     g_frame_new = 1;
     pthread_mutex_unlock(&g_frame_lock);
 }
@@ -204,7 +207,8 @@ void host_run(void) {
     if (g_headless) {
         for (;;) pause();
     }
-    static uint32_t frame[W * H];
+    static uint32_t frame[MAX_FRAME];
+    int fw = W, fh = H, tex_w = 0, tex_h = 0;
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -237,15 +241,24 @@ void host_run(void) {
         int have = 0;
         pthread_mutex_lock(&g_frame_lock);
         if (g_frame_new) {
-            memcpy(frame, g_frame, sizeof frame);
+            fw = g_frame_w;
+            fh = g_frame_h;
+            memcpy(frame, g_frame, sizeof(uint32_t) * (size_t)(fw * fh));
             g_frame_new = 0;
             have = 1;
         }
         pthread_mutex_unlock(&g_frame_lock);
-        if (have) SDL_UpdateTexture(g_texture, NULL, frame, W * 4);
+        if (have && (fw != tex_w || fh != tex_h)) {
+            if (g_texture) SDL_DestroyTexture(g_texture);
+            /* ABGR8888 = bytes R,G,B,A in memory on little-endian: the PSP's own layout. */
+            g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, fw, fh);
+            tex_w = fw;
+            tex_h = fh;
+        }
+        if (have) SDL_UpdateTexture(g_texture, NULL, frame, fw * 4);
         SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
         SDL_RenderClear(g_renderer);
-        SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);
+        if (g_texture) SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);
         SDL_RenderPresent(g_renderer);   /* waits for the display's vsync */
     }
 }

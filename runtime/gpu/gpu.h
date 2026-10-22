@@ -41,5 +41,13 @@ void gpu_frame_end(void);                 /* once per shown frame (free camera b
 void gpu_stats_report(void);   /* ge.c: command counts (MKU_GE_STATS=1) */
 void gpu_draw_report(void);    /* raster.c */
 
+/* surface.c: high-resolution twins of the render targets (MKU_SCALE) */
+extern int g_scale;
+void surf_init(void);
+uint32_t surf_target(uint32_t vaddr, int stride, int fmt, int rows);   /* fmt 4 = depth */
+void surf_writeback(uint32_t addr, uint32_t len);
+uint32_t surf_display(uint32_t vaddr, int stride, int fmt);
+void surf_frame_end(void);
+
 /* display.c / host: the framebuffer the game wants shown */
 void display_framebuffer(uint32_t *addr, uint32_t *width, uint32_t *format);

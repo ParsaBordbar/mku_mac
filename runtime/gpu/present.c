@@ -96,8 +96,11 @@ static void fps_stats(void) {
             fprintf(stderr, "[fps] %llu fps, slowest frame %.1f ms, rendering %.1f ms/frame (%.0f%% of a 16.7 ms frame)\n",
                     (unsigned long long)frames, worst / 1000.0, (g_raster_us - raster_at_start) / 1000.0 / frames,
                     100.0 * (g_raster_us - raster_at_start) / frames / 16683.0);
-        static uint64_t q0, c0, d0, k0[3];
-        extern uint64_t g_area_kind[3];
+        static uint64_t q0, c0, d0, k0[3], td0;
+        extern uint64_t g_area_kind[3], g_tex_decodes;
+        if (window_start && frames)
+            fprintf(stderr, "[fps]   texture decodes per frame: %.1f\n", (double)(g_tex_decodes - td0) / frames);
+        td0 = g_tex_decodes;
         if (window_start && frames)
             fprintf(stderr, "[fps]   bbox pixels per frame: clear %llu, sprites %llu, triangles %llu\n",
                     (unsigned long long)((g_area_kind[0] - k0[0]) / frames), (unsigned long long)((g_area_kind[1] - k0[1]) / frames),
@@ -124,6 +127,19 @@ void present_frame_shown(uint64_t frame) {
     if (dump_at == -2) dump_at = getenv("MKU_GE_DUMP") ? atol(getenv("MKU_GE_DUMP")) : -1;
     g_dump_draws = dump_at >= 0 && frame >= (uint64_t)dump_at && frame < (uint64_t)dump_at + 2;
     gpu_texture_flush();   /* re-validate textures at least once per frame */
+    {   /* hotkeys (host.c) and the fps shown in the window title */
+        int sc, tx;
+        host_take_requests(&sc, &tx);
+        if (sc > 0) surf_set_scale(sc);
+        if (tx > 0) { texpack_set_upscale(tx); gpu_texture_cache_clear(); }
+        static uint64_t sec_start, nframes;
+        uint64_t t = now_us();
+        nframes++;
+        if (t - sec_start >= 1000000u) { host_report_fps((int)nframes); nframes = 0; sec_start = t; }
+    }
+    static long tex_off_at = -2;
+    if (tex_off_at == -2) tex_off_at = getenv("MKU_TEXSCALE_OFF_AT") ? atol(getenv("MKU_TEXSCALE_OFF_AT")) : -1;
+    if ((long)frame == tex_off_at) { texpack_set_upscale(1); gpu_texture_cache_clear(); }
     gpu_frame_end();
     raster_bench_report();
     surf_frame_end();

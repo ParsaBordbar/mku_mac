@@ -9,6 +9,12 @@ void host_submit_frame(const uint32_t *rgba, int w, int h);   /* game thread: a 
 uint32_t host_buttons(void);                /* PSP button bits currently held */
 uint32_t host_analog(void);                 /* lx | ly << 8, 128 = centre */
 void host_camera(float *yaw, float *pitch, float *zoom);   /* free camera (right stick) */
+void host_take_requests(int *scale, int *texscale);  /* game thread: hotkey changes (-1 = none) */
+void host_report_fps(int fps);
+
+/* settings.c: mku.ini */
+void settings_load(void);
+void settings_save(int scale, int texscale, int sharp);
 
 /* audio.c: sound output (SDL); not available when headless */
 void host_audio_init(void);

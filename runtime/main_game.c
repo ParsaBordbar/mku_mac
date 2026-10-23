@@ -5,6 +5,7 @@
 
 void profile_start(void);
 void surf_init(void);
+void texpack_init(void);
 
 #include <stdio.h>
 #include <string.h>
@@ -18,7 +19,9 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* keep [main] and [hle] lines in order */
     rt_init_memory();
     if (rt_load_image(image)) return 1;
+    settings_load();   /* mku.ini -> MKU_* (environment wins) */
     surf_init();
+    texpack_init();
     host_init();
     kernel_init();
     profile_start();

@@ -33,6 +33,45 @@ static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_frame[MAX_FRAME];
 static int g_frame_w = W, g_frame_h = H, g_frame_new;
 
+/* Display settings and their hotkeys (F1 textures, F2 resolution, F3 sharp).
+ * The game thread applies requests at the next frame (host_take_requests). */
+static int g_set_scale = 1, g_set_tex = 1, g_set_sharp;
+static atomic_int g_req_scale = -1, g_req_tex = -1, g_fps;
+
+void settings_save(int scale, int texscale, int sharp);
+
+void host_take_requests(int *scale, int *texscale) {
+    *scale = atomic_exchange(&g_req_scale, -1);
+    *texscale = atomic_exchange(&g_req_tex, -1);
+}
+
+void host_report_fps(int fps) { atomic_store(&g_fps, fps); }
+
+static void update_title(void) {
+    char t[160];
+    snprintf(t, sizeof t, "Mortal Kombat: Unchained (native) - %dx%d, textures %s - %d fps   [F1 textures  F2 resolution  F3 %s]",
+             480 * g_set_scale, 272 * g_set_scale, g_set_tex > 1 ? (g_set_tex == 2 ? "xBRZ 2x" : "xBRZ 4x") : "original",
+             atomic_load(&g_fps), g_set_sharp ? "smooth" : "sharp");
+    SDL_SetWindowTitle(g_window, t);
+}
+
+static void hotkey(SDL_Scancode k) {
+    if (k == SDL_SCANCODE_F1) {
+        g_set_tex = g_set_tex == 1 ? 2 : g_set_tex == 2 ? 4 : 1;
+        atomic_store(&g_req_tex, g_set_tex);
+    } else if (k == SDL_SCANCODE_F2) {
+        g_set_scale = g_set_scale % 4 + 1;
+        atomic_store(&g_req_scale, g_set_scale);
+    } else if (k == SDL_SCANCODE_F3) {
+        g_set_sharp = !g_set_sharp;
+        if (g_texture) SDL_SetTextureScaleMode(g_texture, g_set_sharp ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
+    } else {
+        return;
+    }
+    settings_save(g_set_scale, g_set_tex, g_set_sharp);
+    update_title();
+}
+
 static _Atomic uint32_t g_buttons;
 static _Atomic uint32_t g_analog = 0x8080;   /* lx | ly << 8 */
 static SDL_GameController *g_pad;
@@ -51,9 +90,16 @@ void host_init(void) {
      * The texture is (re)created at the rendering resolution on the first frame. */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, getenv("MKU_SHARP") ? "0" : "1");
     g_headless = 0;
+    if (getenv("MKU_SCALE")) g_set_scale = atoi(getenv("MKU_SCALE"));
+    if (getenv("MKU_TEXSCALE")) g_set_tex = atoi(getenv("MKU_TEXSCALE"));
+    if (g_set_scale < 1 || g_set_scale > 4) g_set_scale = 1;
+    if (g_set_tex != 2 && g_set_tex != 4) g_set_tex = 1;
+    g_set_sharp = getenv("MKU_SHARP") != NULL;
+    update_title();
     host_audio_init();
     fprintf(stderr, "[host] window open. Keys: arrows=d-pad, Enter=START, RShift=SELECT, "
-                    "Z=X(cross) X=O(circle) A=[] S=/\\, Q/W=L/R, IJKL=analog, Esc=quit\n");
+                    "Z=X(cross) X=O(circle) A=[] S=/\\, Q/W=L/R, IJKL=analog, TFGH/RY/C=camera, "
+                    "F1=HD textures F2=resolution F3=sharp, Esc=quit\n");
 }
 
 /* Game thread: a complete frame is ready (called from sceDisplaySetFrameBuf). */
@@ -216,6 +262,7 @@ void host_run(void) {
                 fprintf(stderr, "[host] quit\n");
                 exit(0);
             }
+            if (e.type == SDL_KEYDOWN && !e.key.repeat) hotkey(e.key.keysym.scancode);
             if (e.type == SDL_CONTROLLERDEVICEADDED && !g_pad) {
                 g_pad = SDL_GameControllerOpen(e.cdevice.which);
                 if (g_pad) fprintf(stderr, "[host] controller: %s\n", SDL_GameControllerName(g_pad));
@@ -252,10 +299,16 @@ void host_run(void) {
             if (g_texture) SDL_DestroyTexture(g_texture);
             /* ABGR8888 = bytes R,G,B,A in memory on little-endian: the PSP's own layout. */
             g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, fw, fh);
+            SDL_SetTextureScaleMode(g_texture, g_set_sharp ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
             tex_w = fw;
             tex_h = fh;
         }
         if (have) SDL_UpdateTexture(g_texture, NULL, frame, fw * 4);
+        {   /* refresh the fps in the title once a second */
+            static uint32_t last_title;
+            uint32_t now = SDL_GetTicks();
+            if (now - last_title > 1000) { last_title = now; update_title(); }
+        }
         SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
         SDL_RenderClear(g_renderer);
         if (g_texture) SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);

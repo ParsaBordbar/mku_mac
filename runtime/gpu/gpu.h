@@ -48,6 +48,14 @@ uint32_t surf_target(uint32_t vaddr, int stride, int fmt, int rows);   /* fmt 4 
 void surf_writeback(uint32_t addr, uint32_t len);
 uint32_t surf_display(uint32_t vaddr, int stride, int fmt);
 void surf_frame_end(void);
+void surf_set_scale(int n);
+
+/* texpack.c: HD texture dumps, replacement packs, xBRZ upscaling */
+void texpack_init(void);
+uint32_t *texpack_process(const uint32_t *px, int w, int h, int *ow, int *oh);
+void texpack_set_upscale(int factor);
+int texpack_upscale(void);
+void gpu_texture_cache_clear(void);   /* raster.c */
 
 /* display.c / host: the framebuffer the game wants shown */
 void display_framebuffer(uint32_t *addr, uint32_t *width, uint32_t *format);

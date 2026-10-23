@@ -6,6 +6,7 @@
 
 ELF    ?= ../work/mkunchained-psp/BOOT.elf
 CC     := clang
+CXX    := clang++
 CFLAGS := -O2 -g -w -ffp-contract=off -fno-math-errno -Iruntime -Ibuild/recomp
 RT_OPT := -O3
 SDL_CFLAGS := $(shell sdl2-config --cflags)
@@ -34,19 +35,32 @@ game: recomp
 
 GEN_C   = $(wildcard build/recomp/*.c)
 RT_C    = $(wildcard runtime/*.c runtime/hle/*.c runtime/patches/*.c runtime/gpu/*.c runtime/host/*.c)
+# Third-party code (fetched by tools/fetch_third_party.sh): xBRZ texture upscaler.
+TP_OBJS = build/obj/tp/xbrz.o build/obj/tp/xbrz_glue.o
 OBJS    = $(patsubst build/recomp/%.c,build/obj/gen/%.o,$(GEN_C)) \
-          $(patsubst runtime/%.c,build/obj/rt/%.o,$(RT_C))
+          $(patsubst runtime/%.c,build/obj/rt/%.o,$(RT_C)) $(TP_OBJS)
 
 build/mku: $(OBJS)
-	$(CC) $(OBJS) $(SDL_LIBS) $(AV_LIBS) -o $@
+	$(CXX) $(OBJS) $(SDL_LIBS) $(AV_LIBS) -o $@
+
+third_party/xbrz/xbrz.cpp third_party/stb/stb_image.h:
+	@echo "missing $@ -- run tools/fetch_third_party.sh" && false
+
+build/obj/tp/xbrz.o: third_party/xbrz/xbrz.cpp
+	@mkdir -p $(@D)
+	$(CXX) -O2 -std=c++17 -w -Iruntime/thirdparty -c $< -o $@
+
+build/obj/tp/xbrz_glue.o: runtime/thirdparty/xbrz_glue.cpp third_party/xbrz/xbrz.cpp
+	@mkdir -p $(@D)
+	$(CXX) -O2 -std=c++17 -w -Iruntime/thirdparty -Ithird_party/xbrz -c $< -o $@
 
 build/obj/gen/%.o: build/recomp/%.c runtime/recomp.h build/recomp/funcs.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-build/obj/rt/%.o: runtime/%.c runtime/recomp.h runtime/hle/kernel.h runtime/fiber.h runtime/gpu/gpu.h runtime/host/host.h
+build/obj/rt/%.o: runtime/%.c runtime/recomp.h runtime/hle/kernel.h runtime/fiber.h runtime/gpu/gpu.h runtime/host/host.h third_party/stb/stb_image.h
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(RT_OPT) $(SDL_CFLAGS) $(AV_CFLAGS) -Wall -Wno-unused-function -c $< -o $@
+	$(CC) $(CFLAGS) $(RT_OPT) $(SDL_CFLAGS) $(AV_CFLAGS) -Ithird_party -Wall -Wno-unused-function -c $< -o $@
 
 # The runtime reads game files straight from your ISO (read-only).
 run: game

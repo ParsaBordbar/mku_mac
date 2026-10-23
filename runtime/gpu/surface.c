@@ -186,3 +186,17 @@ uint32_t surf_display(uint32_t vaddr, int stride, int fmt) {
 }
 
 void surf_frame_end(void) { g_frame_no++; }
+
+/* Change the rendering resolution at a frame boundary (F2): bring VRAM up to
+ * date from the old twins, then start over with new ones. */
+void surf_set_scale(int n) {
+    if (n < 1) n = 1;
+    if (n > 4) n = 4;
+    if (n == g_scale) return;
+    gpu_flush();
+    for (int i = 0; i < g_nsurf; i++)
+        if (g_surf[i].dirty) downsample(&g_surf[i]);
+    g_nsurf = 0;
+    g_scale = n;
+    fprintf(stderr, "[gpu] rendering at %dx (%dx%d)\n", g_scale, 480 * g_scale, 272 * g_scale);
+}

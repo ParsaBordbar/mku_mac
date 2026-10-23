@@ -211,20 +211,24 @@ static void decode_vertex(const VFormat *f, uint32_t addr, float pos[3], float u
 typedef struct {
     uint32_t addr;
     int w, h, stride, fmt, swizzled, clamp_u, clamp_v, linear;
-    const uint32_t *px;   /* decoded RGBA8888 (R in the low byte), w*h */
+    const uint32_t *px;   /* decoded RGBA8888 (R in the low byte), pw*ph */
+    int pw, ph, sc;       /* size of px: w*sc x h*sc (sc > 1: HD replacement or upscaled, texpack.c) */
 } Texture;
 
 static uint8_t g_clut[1024 * 4];
 
 static uint32_t g_clut_version;   /* bumps whenever the palette changes */
 
+/* LOADCLUT: the palette is copied now (games reuse its memory right after).
+ * g_clut_version is a hash of its contents, so textures drawn with palettes
+ * that alternate (one per fighter) each keep their own cache entry. */
 static void load_clut(void) {
     uint32_t addr = (ge.cmd[GE_CLUTADDR] & 0x00FFFFF0) | ((ge.cmd[GE_CLUTADDRUPPER] << 8) & 0x0F000000);
     uint32_t blocks = (ge.cmd[GE_LOADCLUT] & 0x7F) == 0x40 ? 0x40 : ge.cmd[GE_LOADCLUT] & 0x3F;
-    if (memcmp(g_clut, rt_ptr(addr), blocks * 32)) {
-        memcpy(g_clut, rt_ptr(addr), blocks * 32);
-        g_clut_version++;
-    }
+    memcpy(g_clut, rt_ptr(addr), blocks * 32);
+    uint64_t h = 1469598103934665603ull, w;
+    for (uint32_t i = 0; i < blocks * 32; i += 8) { memcpy(&w, g_clut + i, 8); h = (h ^ w) * 1099511628211ull; }
+    g_clut_version = (uint32_t)(h ^ (h >> 32)) ^ blocks;
 }
 
 static int bits_per_texel(int fmt) {
@@ -283,16 +287,25 @@ static Rgba fetch_texel(const Texture *t, int x, int y) {
  * they changed. */
 typedef struct {
     uint32_t addr, key, clut_version, verified_gen;
-    int w, h, fmt;
+    int w, h, fmt, pw, ph;
+    uint32_t last_used;
     uint64_t hash;
     uint32_t *px;
 } TexEntry;
 
-#define TEX_CACHE 512
+#define TEX_CACHE 4096
 static TexEntry g_tex[TEX_CACHE];
 static uint32_t g_tex_gen = 1, g_tex_clock;
+uint64_t g_tex_decodes;   /* MKU_FPS stats */
+extern int g_dump_draws;
 
 void gpu_texture_flush(void) { g_tex_gen++; }
+
+/* Forget every decoded texture (after switching HD textures on or off). */
+void gpu_texture_cache_clear(void) {
+    gpu_flush();
+    for (int i = 0; i < TEX_CACHE; i++) { free(g_tex[i].px); g_tex[i].px = NULL; }
+}
 
 static uint64_t hash_bytes(uint32_t addr, uint32_t n) {
     const uint8_t *p = rt_ptr(addr);
@@ -314,9 +327,19 @@ static void decode_texture(TexEntry *e, const Texture *t) {
             Rgba c = fetch_texel(&raw, x, y);
             e->px[y * t->w + x] = (uint32_t)c.r | (uint32_t)c.g << 8 | (uint32_t)c.b << 16 | (uint32_t)c.a << 24;
         }
+    e->pw = t->w;
+    e->ph = t->h;
+    int ow, oh;
+    uint32_t *hd = texpack_process(e->px, t->w, t->h, &ow, &oh);   /* dump / HD replacement / xBRZ */
+    if (hd) {
+        free(e->px);
+        e->px = hd;
+        e->pw = ow;
+        e->ph = oh;
+    }
 }
 
-static const uint32_t *cached_texture(const Texture *t) {
+static const uint32_t *cached_texture(Texture *t) {
     /* queued draws may still render into this texture (render-to-texture) */
     if ((t->addr & 0x0FE00000u) == (VRAM_BASE & 0x0FE00000u)) {
         gpu_flush();
@@ -327,30 +350,49 @@ static const uint32_t *cached_texture(const Texture *t) {
                    (uint32_t)t->stride * 2654435761u;
     uint32_t clutv = pal ? g_clut_version ^ ge.cmd[GE_CLUTFORMAT] * 40503u : 0;
     uint32_t bytes = (uint32_t)t->stride * (uint32_t)t->h * (uint32_t)bits_per_texel(t->fmt) / 8;
-    uint32_t slot = ((t->addr >> 4) ^ key) % TEX_CACHE;
-    TexEntry *e = &g_tex[slot];
+    /* 4-way set associative: a texture can live in any of 4 entries of its set */
+    uint32_t mix = (t->addr ^ key ^ clutv) * 0x9E3779B1u;   /* Fibonacci hashing: spread the bits */
+    uint32_t set = ((mix >> 22) % (TEX_CACHE / 4)) * 4;
+    TexEntry *e = NULL;
+    for (int k = 0; k < 4 && !e; k++) {
+        TexEntry *c = &g_tex[set + k];
+        if (c->px && c->addr == t->addr && c->key == key && c->clut_version == clutv) e = c;
+    }
+    if (!e) {   /* miss: take an empty entry, else the least recently used */
+        e = &g_tex[set];
+        for (int k = 0; k < 4; k++) {
+            TexEntry *c = &g_tex[set + k];
+            if (!c->px) { e = c; break; }
+            if (c->last_used < e->last_used) e = c;
+        }
+    }
+    e->last_used = ++g_tex_clock;
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("MKU_NO_TEXCACHE") != NULL;
     if (nocache) e->verified_gen = 0;   /* debug: re-hash the source on every use */
     if (e->px && e->addr == t->addr && e->key == key && e->clut_version == clutv) {
+        t->pw = e->pw; t->ph = e->ph; t->sc = e->pw / t->w;
         if (e->verified_gen == g_tex_gen) return e->px;
         uint64_t h = hash_bytes(t->addr, bytes);
         if (h == e->hash) { e->verified_gen = g_tex_gen; return e->px; }
         e->hash = h;
+        if (g_dump_draws) fprintf(stderr, "[texlog] CHANGED addr=%08X %dx%d fmt=%d clut=%08X\n", t->addr, t->w, t->h, t->fmt, clutv);
     } else {
         e->hash = hash_bytes(t->addr, bytes);
+        if (g_dump_draws) fprintf(stderr, "[texlog] MISS    addr=%08X %dx%d fmt=%d clut=%08X (evicting %08X)\n", t->addr, t->w, t->h, t->fmt, clutv, e->addr);
     }
     e->addr = t->addr; e->key = key; e->clut_version = clutv; e->w = t->w; e->h = t->h; e->fmt = t->fmt;
     e->verified_gen = g_tex_gen;
     decode_texture(e, t);
-    g_tex_clock++;
+    g_tex_decodes++;
+    t->pw = e->pw; t->ph = e->ph; t->sc = e->pw / t->w;
     return e->px;
 }
 
 static inline uint32_t texel(const Texture *t, int x, int y) {
-    if (t->clamp_u) x = x < 0 ? 0 : x >= t->w ? t->w - 1 : x; else x &= t->w - 1;
-    if (t->clamp_v) y = y < 0 ? 0 : y >= t->h ? t->h - 1 : y; else y &= t->h - 1;
-    return t->px[y * t->w + x];
+    if (t->clamp_u) x = x < 0 ? 0 : x >= t->pw ? t->pw - 1 : x; else x &= t->pw - 1;
+    if (t->clamp_v) y = y < 0 ? 0 : y >= t->ph ? t->ph - 1 : y; else y &= t->ph - 1;
+    return t->px[y * t->pw + x];
 }
 
 static inline Rgba rgba_of(uint32_t p) { return (Rgba){(int)(p & 255), (int)((p >> 8) & 255), (int)((p >> 16) & 255), (int)(p >> 24)}; }
@@ -358,6 +400,7 @@ static inline Rgba rgba_of(uint32_t p) { return (Rgba){(int)(p & 255), (int)((p 
 /* Bilinear (or nearest) texture lookup. The 2x2 footprint's wrapped/clamped
  * coordinates are worked out once, not per texel. */
 static inline __attribute__((always_inline)) Rgba sample(const Texture *t, float u, float v) {
+    if (t->sc > 1) { u *= (float)t->sc; v *= (float)t->sc; }   /* HD texture: texel space is sc times finer */
     if (!t->linear) return rgba_of(texel(t, (int)floorf(u), (int)floorf(v)));
     float fu = u - 0.5f, fv = v - 0.5f;
     float flu = floorf(fu), flv = floorf(fv);
@@ -365,20 +408,20 @@ static inline __attribute__((always_inline)) Rgba sample(const Texture *t, float
     int ax = (int)((fu - flu) * 256.f), ay = (int)((fv - flv) * 256.f);   /* 8-bit fixed-point weights */
     int xa, xb, ya, yb;
     if (t->clamp_u) {
-        xa = x0 < 0 ? 0 : x0 >= t->w ? t->w - 1 : x0;
-        xb = x0 + 1 < 0 ? 0 : x0 + 1 >= t->w ? t->w - 1 : x0 + 1;
+        xa = x0 < 0 ? 0 : x0 >= t->pw ? t->pw - 1 : x0;
+        xb = x0 + 1 < 0 ? 0 : x0 + 1 >= t->pw ? t->pw - 1 : x0 + 1;
     } else {
-        xa = x0 & (t->w - 1);
-        xb = (x0 + 1) & (t->w - 1);
+        xa = x0 & (t->pw - 1);
+        xb = (x0 + 1) & (t->pw - 1);
     }
     if (t->clamp_v) {
-        ya = y0 < 0 ? 0 : y0 >= t->h ? t->h - 1 : y0;
-        yb = y0 + 1 < 0 ? 0 : y0 + 1 >= t->h ? t->h - 1 : y0 + 1;
+        ya = y0 < 0 ? 0 : y0 >= t->ph ? t->ph - 1 : y0;
+        yb = y0 + 1 < 0 ? 0 : y0 + 1 >= t->ph ? t->ph - 1 : y0 + 1;
     } else {
-        ya = y0 & (t->h - 1);
-        yb = (y0 + 1) & (t->h - 1);
+        ya = y0 & (t->ph - 1);
+        yb = (y0 + 1) & (t->ph - 1);
     }
-    const uint32_t *r0 = t->px + ya * t->w, *r1 = t->px + yb * t->w;
+    const uint32_t *r0 = t->px + ya * t->pw, *r1 = t->px + yb * t->pw;
     uint32_t c00 = r0[xa], c10 = r0[xb], c01 = r1[xa], c11 = r1[xb];
     /* Per channel: ((c00*(256-ax) + c10*ax)*(256-ay) + (c01*(256-ax) + c11*ax)*ay + 32768) >> 16,
      * computed two channels at a time ("SIMD within a register"): R and B
@@ -411,6 +454,7 @@ static Texture current_texture(void) {
     t.clamp_v = (ge.cmd[GE_TEXWRAP] >> 8) & 1;
     t.linear = (ge.cmd[GE_TEXFILTER] >> 8) & 1;   /* magnification filter */
     if (t.stride == 0) t.stride = t.w;
+    t.pw = t.w; t.ph = t.h; t.sc = 1;
     t.px = cached_texture(&t);
     return t;
 }

@@ -250,6 +250,7 @@ static void *host_main(void *p) {
     struct HostArg a = *(struct HostArg *)p;
     free(p);
     Thread *t = a.t;
+    rt_thread_high_priority();
     pthread_mutex_lock(&g_lock);
     wait_for_baton(t, a.generation);
     rt_call_indirect(&t->ctx, t->entry);      /* the thread's whole life */

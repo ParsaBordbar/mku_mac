@@ -1,7 +1,7 @@
 # mku-port build
 #   make            find functions, recompile, build build/mku
 #   make test       recompiler test suite
-#   make run        build and run
+#   make run        build and run (players: use ./mku-play instead)
 # Pass ELF=path/to/BOOT.elf if your dump lives elsewhere.
 
 ELF    ?= ../work/mkunchained-psp/BOOT.elf
@@ -12,8 +12,13 @@ RT_OPT := -O3
 SDL_CFLAGS := $(shell sdl2-config --cflags)
 SDL_LIBS   := $(shell sdl2-config --libs)
 FFMPEG     := $(shell brew --prefix ffmpeg 2>/dev/null)
+ifneq ($(FFMPEG),)
 AV_CFLAGS  := -I$(FFMPEG)/include
 AV_LIBS    := -L$(FFMPEG)/lib -lavcodec -lavutil
+else
+AV_CFLAGS  := $(shell pkg-config --cflags libavcodec libavutil 2>/dev/null)
+AV_LIBS    := $(shell pkg-config --libs libavcodec libavutil 2>/dev/null)
+endif
 
 .PHONY: all recomp game run test clean pads
 
@@ -41,7 +46,7 @@ OBJS    = $(patsubst build/recomp/%.c,build/obj/gen/%.o,$(GEN_C)) \
           $(patsubst runtime/%.c,build/obj/rt/%.o,$(RT_C)) $(TP_OBJS)
 
 build/mku: $(OBJS)
-	$(CXX) $(OBJS) $(SDL_LIBS) $(AV_LIBS) -o $@
+	$(CXX) $(OBJS) $(SDL_LIBS) $(AV_LIBS) -lm -lpthread -o $@
 
 third_party/xbrz/xbrz.cpp third_party/stb/stb_image.h:
 	@echo "missing $@ -- run tools/fetch_third_party.sh" && false
@@ -70,6 +75,8 @@ test:
 	python3 -I tests/recomp/run.py
 	python3 -I tests/recomp/run.py -i
 	@mkdir -p build && $(CC) -O2 -Wall -Iruntime tests/runtime/fiber_test.c runtime/fiber.c -o build/fiber_test && ./build/fiber_test
+	@$(CC) -O2 -Wall -Iruntime tests/runtime/lighting_test.c runtime/gpu/lighting.c -lm -o build/lighting_test && ./build/lighting_test
+	@python3 -I tests/tool/test_mku_play.py
 
 # List connected game controllers (PS4/PS5/Xbox...) as SDL sees them.
 pads:

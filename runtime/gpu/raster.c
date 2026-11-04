@@ -8,12 +8,12 @@
  *        ──► per pixel: texture, texture function, alpha/stencil/depth tests,
  *            blend, colour mask ──► write the framebuffer in its pixel format
  *
- * Not yet: lighting, fog, texture projection/env-map modes, mipmaps, splines,
- * logic ops, dithering, proper near-plane clipping (triangles behind the
- * camera are dropped).
+ * Lighting, fog, backface culling, near-plane clipping and texture coordinate
+ * generation are in. Not yet: mipmaps, splines, logic ops, dithering.
  */
 #include "gpu.h"
 #include "ge_cmds.h"
+#include "lighting.h"
 #include "../host/host.h"
 
 #include <math.h>
@@ -34,6 +34,7 @@ typedef struct {
     float x, y, z, w;      /* screen x/y (pixels), depth (0..65535), 1/w for perspective */
     float u, v;            /* texture coords in texels */
     float r, g, b, a;      /* colour 0..255 */
+    float fog;             /* 1 = no fog, 0 = all fog colour */
 } Vert;
 
 static Vert g_verts[MAX_VERTS];
@@ -152,8 +153,8 @@ static void mul43(const float *m, const float in[3], float out[3]) {   /* 4x3 co
 }
 
 /* Decode one vertex (with morphing and skinning) into object/screen space. */
-static void decode_vertex(const VFormat *f, uint32_t addr, float pos[3], float uv[2], Rgba *col) {
-    float p[3] = {0}, t[2] = {0}, c[4] = {0};
+static void decode_vertex(const VFormat *f, uint32_t addr, float pos[3], float uv[2], Rgba *col, float nrm[3]) {
+    float p[3] = {0}, t[2] = {0}, c[4] = {0}, n[3] = {0};
     int has_col = f->col >= 4;
     for (int m = 0; m < f->nmorph; m++) {
         uint32_t a = addr + (uint32_t)(m * f->size);
@@ -172,6 +173,8 @@ static void decode_vertex(const VFormat *f, uint32_t addr, float pos[3], float u
             Rgba cc = unpack(raw, f->col == 4 ? 0 : f->col == 5 ? 1 : f->col == 6 ? 2 : 3);
             c[0] += cc.r * w; c[1] += cc.g * w; c[2] += cc.b * w; c[3] += cc.a * w;
         }
+        if (f->nrm)
+            for (int i = 0; i < 3; i++) n[i] += read_comp(a + f->o_nrm, f->nrm, i, 0) * w;
         for (int i = 0; i < 3; i++) {
             float v;
             if (f->through) {   /* screen coordinates: x, y signed, z unsigned */
@@ -184,7 +187,7 @@ static void decode_vertex(const VFormat *f, uint32_t addr, float pos[3], float u
         }
     }
     if (f->wt && !f->through) {   /* skinning: blend the position through up to 8 bone matrices */
-        float sk[3] = {0};
+        float sk[3] = {0}, skn[3] = {0};
         for (int b = 0; b < f->nweights; b++) {
             float w = f->wt == 1 ? MEM_LBU(addr + f->o_wt + b) / 128.f
                     : f->wt == 2 ? MEM_LHU(addr + f->o_wt + 2 * b) / 32768.f
@@ -192,15 +195,19 @@ static void decode_vertex(const VFormat *f, uint32_t addr, float pos[3], float u
             float o[3];
             mul43(&ge.bone[12 * b], p, o);
             for (int i = 0; i < 3; i++) sk[i] += o[i] * w;
+            const float *m = &ge.bone[12 * b];
+            for (int i = 0; i < 3; i++) skn[i] += (n[0] * m[i] + n[1] * m[3 + i] + n[2] * m[6 + i]) * w;
         }
         memcpy(p, sk, sizeof p);
+        memcpy(n, skn, sizeof n);
     }
     memcpy(pos, p, sizeof p);
+    memcpy(nrm, n, sizeof n);
     uv[0] = t[0];
     uv[1] = t[1];
     if (has_col) *col = (Rgba){(int)c[0], (int)c[1], (int)c[2], (int)c[3]};
-    else {   /* no vertex colour: material diffuse/alpha */
-        Rgba m = unpack(ge.cmd[GE_MATERIALDIFFUSE] | ((ge.cmd[GE_MATERIALALPHA] & 0xFF) << 24), 3);
+    else {   /* no vertex colour: material ambient and alpha */
+        Rgba m = unpack(ge.cmd[GE_MATERIALAMBIENT] | ((ge.cmd[GE_MATERIALALPHA] & 0xFF) << 24), 3);
         *col = m;
     }
 }
@@ -478,6 +485,9 @@ typedef struct {
     int gouraud;
     Texture tex;
     int fast_blend;   /* blend is src*a + dst*(1-a), added */
+    int fog;          /* fog is applied (3D only) */
+    Rgba fog_color;
+    int cull;         /* 0 off, else 1 + the CULL register: see tri_visible() */
 } Pipe;
 
 static inline __attribute__((always_inline)) int compare(int func, int a, int b) {
@@ -546,6 +556,9 @@ static Pipe setup_pipe(void) {
         p.sx2 = (p.sx2 + 1) * n - 1; p.sy2 = (p.sy2 + 1) * n - 1;
     }
     p.fast_blend = p.blend && p.bl_a == 2 && p.bl_b == 3 && p.bl_eq == 0;
+    p.fog = !p.clear && (ge.cmd[GE_FOGENABLE] & 1);
+    p.fog_color = unpack(ge.cmd[GE_FOGCOLOR] | 0xFF000000u, 3);
+    p.cull = !p.clear && (ge.cmd[GE_CULLFACEENABLE] & 1) ? 1 + (ge.cmd[GE_CULL] & 1) : 0;
     return p;
 }
 
@@ -577,11 +590,19 @@ static int blend_factor(int which, int f, Rgba s, Rgba d, Rgba fix, int ch) {
     }
 }
 
+/* Fog: after the alpha test, before blending. f8 = fog factor 0..255. */
+static inline void apply_fog(const Pipe *p, Rgba *c, float fog) {
+    int f8 = fog >= 1.f ? 255 : fog <= 0.f ? 0 : (int)(fog * 256.f);
+    c->r = (c->r * f8 + p->fog_color.r * (255 - f8)) / 255;
+    c->g = (c->g * f8 + p->fog_color.g * (255 - f8)) / 255;
+    c->b = (c->b * f8 + p->fog_color.b * (255 - f8)) / 255;
+}
+
 static uint64_t g_bench_pixels;   /* MKU_RASTER_BENCH: pixels shaded in the serial replay */
 static int g_bench_skip;          /* MKU_BENCH_SKIP: 1 = no pixel shading, 2 = no texturing (timing experiments) */
 static int g_bench_counting;
 
-static void shade_pixel_ref(const Pipe *p, int x, int y, float z, float u, float v, Rgba col) {
+static void shade_pixel_ref(const Pipe *p, int x, int y, float z, float u, float v, Rgba col, float fog) {
     if (x < p->sx1 || x > p->sx2 || y < p->sy1 || y > p->sy2) return;
     if (g_bench_counting) g_bench_pixels++;
     int bpp = p->fb_fmt == 3 ? 4 : 2;
@@ -624,6 +645,7 @@ static void shade_pixel_ref(const Pipe *p, int x, int y, float z, float u, float
     }
 
     if (p->alpha_test && !compare(p->at_func, c.a & p->at_mask, p->at_ref & p->at_mask)) return;
+    if (p->fog) apply_fog(p, &c, fog);
 
     uint32_t dst_raw = bpp == 4 ? MEM_LW(fa) : MEM_LHU(fa);
     Rgba d = unpack(dst_raw, p->fb_fmt);
@@ -720,7 +742,7 @@ static inline int blend_eq(int eq, int sc, int dc, int sv, int dv) {
  * stays as the readable reference; MKU_RASTER_CHECK=1 compares the two on
  * every batch), without its generic per-channel helpers, and with the common
  * src-alpha blend and "no colour mask" cases taken out. */
-static inline __attribute__((always_inline)) void shade_pixel(const Pipe *p, int x, int y, float z, float u, float v, Rgba c) {
+static inline __attribute__((always_inline)) void shade_pixel(const Pipe *p, int x, int y, float z, float u, float v, Rgba c, float fog) {
     if (x < p->sx1 || x > p->sx2 || y < p->sy1 || y > p->sy2) return;
     if (g_bench_counting) g_bench_pixels++;
     int bpp = p->fb_fmt == 3 ? 4 : 2;
@@ -761,6 +783,7 @@ static inline __attribute__((always_inline)) void shade_pixel(const Pipe *p, int
         c.r = clamp255(c.r * mul); c.g = clamp255(c.g * mul); c.b = clamp255(c.b * mul); c.a = clamp255(c.a);
     }
     if (p->alpha_test && !compare(p->at_func, c.a & p->at_mask, p->at_ref & p->at_mask)) return;
+    if (p->fog) apply_fog(p, &c, fog);
 
     uint32_t raw;
     if (bpp == 4) memcpy(&raw, fp, 4);
@@ -852,9 +875,9 @@ static inline void draw_triangle(const Pipe *p, const Vert *a, const Vert *b, co
     int gouraud = p->gouraud;
     Rgba fc = {(int)flat->r, (int)flat->g, (int)flat->b, (int)flat->a};
 
-    /* per-vertex values of the interpolated quantities: [0]=q (1/w), then
-     * u, v, r, g, b, a (each times q when perspective-correct), [7]=z */
-    enum { Q, U, V, R, G, B, A, Z, NATTR };
+    /* per-vertex values of the interpolated quantities: q (1/w), u, v and the
+     * colours (times q when perspective-correct); z and fog are linear on screen */
+    enum { Q, U, V, Z, F, R, G, B, A, NATTR };
     float va[3][NATTR];
     const Vert *vs[3] = {a, b, c};
     for (int i = 0; i < 3; i++) {
@@ -864,6 +887,7 @@ static inline void draw_triangle(const Pipe *p, const Vert *a, const Vert *b, co
         va[i][U] = t->u * q; va[i][V] = t->v * q;
         va[i][R] = t->r * q; va[i][G] = t->g * q; va[i][B] = t->b * q; va[i][A] = t->a * q;
         va[i][Z] = t->z;
+        va[i][F] = t->fog;
     }
     float d0[NATTR], d1[NATTR], ddx[NATTR];   /* S = s2 + w0*d0 + w1*d1 */
     for (int k = 0; k < NATTR; k++) {
@@ -871,7 +895,7 @@ static inline void draw_triangle(const Pipe *p, const Vert *a, const Vert *b, co
         d1[k] = va[1][k] - va[2][k];
         ddx[k] = d0[k] * w0_dx + d1[k] * w1_dx;
     }
-    int nattr = gouraud ? NATTR : A + 1;   /* colours only matter when gouraud */
+    int nattr = gouraud ? NATTR : F + 1;   /* colours only matter when gouraud */
 
     for (int y = y0; y < y1; y++) {
         float py = y + 0.5f;
@@ -906,14 +930,13 @@ static inline void draw_triangle(const Pipe *p, const Vert *a, const Vert *b, co
                     col.a = (int)(at[A] * iw + 0.5f);
                 }
                 float u = at[U] * iw, v = at[V] * iw;
-                if (ref) shade_pixel_ref(p, x, y, at[Z], u, v, col);
+                if (ref) shade_pixel_ref(p, x, y, at[Z], u, v, col, at[F]);
                 else if (g_bench_skip == 1) g_bench_pixels += (int)u ^ col.r;
-                else shade_pixel(p, x, y, at[Z], u, v, col);
+                else shade_pixel(p, x, y, at[Z], u, v, col, at[F]);
             }
             w0 += w0_dx;
             w1 += w1_dx;
             for (int k = 0; k < nattr; k++) at[k] += ddx[k];
-            if (!gouraud) at[Z] += ddx[Z];
         }
     }
 }
@@ -933,7 +956,7 @@ static inline void draw_sprite(const Pipe *p, const Vert *a, const Vert *b, int 
         for (int x = x0 < p->sx1 ? p->sx1 : x0; x < x1 && x <= p->sx2; x++) {
             float tx = dx != 0.f ? ((x + 0.5f) - a->x) / dx : 0.f;
             float uu = a->u + (b->u - a->u) * tx;
-            if (ref) shade_pixel_ref(p, x, y, b->z, uu, v, col); else shade_pixel(p, x, y, b->z, uu, v, col);
+            if (ref) shade_pixel_ref(p, x, y, b->z, uu, v, col, b->fog); else shade_pixel(p, x, y, b->z, uu, v, col, b->fog);
         }
     }
 }
@@ -1055,6 +1078,7 @@ static int g_spin_limit = 4000;
 
 static void *worker(void *arg) {
     (void)arg;
+    rt_thread_high_priority();
     uint64_t seen = 0;
     for (;;) {
         uint64_t g;
@@ -1270,10 +1294,11 @@ static void camera_apply(float v[3]) {
 }
 
 /* object space -> clip space (before the divide by w) */
-static void transform(const float pos[3], int skinned, float c[4]) {
-    float wv[3], vv[3];
+static void transform(const float pos[3], int skinned, float c[4], float wv[3], float *view_z) {
+    float vv[3];
     mul43(ge.world, pos, wv);
     mul43(ge.view, wv, vv);
+    *view_z = vv[2];   /* for fog: the game's own camera, not the free camera */
     if (skinned) { g_pivot_acc += vv[2]; g_pivot_n++; }
     g_pivot_acc_all += vv[2]; g_pivot_n_all++;
     if (g_cam.on) camera_apply(vv);
@@ -1298,13 +1323,13 @@ static void project(const float c[4], Vert *out) {
  * space, where all attributes are still linear, giving up to two triangles. */
 #define NEAR_W 1e-3f
 
-typedef struct { float c[4], u, v, r, g, b, a; } ClipV;
+typedef struct { float c[4], u, v, r, g, b, a, fog; } ClipV;
 
 static float g_clip[MAX_VERTS][4];
 
 static ClipV clipv(int i) {
     const Vert *v = &g_verts[i];
-    ClipV o = {{g_clip[i][0], g_clip[i][1], g_clip[i][2], g_clip[i][3]}, v->u, v->v, v->r, v->g, v->b, v->a};
+    ClipV o = {{g_clip[i][0], g_clip[i][1], g_clip[i][2], g_clip[i][3]}, v->u, v->v, v->r, v->g, v->b, v->a, v->fog};
     return o;
 }
 
@@ -1314,13 +1339,14 @@ static ClipV lerp_clip(const ClipV *p, const ClipV *q, float t) {
     o.u = p->u + (q->u - p->u) * t; o.v = p->v + (q->v - p->v) * t;
     o.r = p->r + (q->r - p->r) * t; o.g = p->g + (q->g - p->g) * t;
     o.b = p->b + (q->b - p->b) * t; o.a = p->a + (q->a - p->a) * t;
+    o.fog = p->fog + (q->fog - p->fog) * t;
     return o;
 }
 
 static Vert screen_of(const ClipV *p) {
     Vert v;
     project(p->c, &v);
-    v.u = p->u; v.v = p->v; v.r = p->r; v.g = p->g; v.b = p->b; v.a = p->a;
+    v.u = p->u; v.v = p->v; v.r = p->r; v.g = p->g; v.b = p->b; v.a = p->a; v.fog = p->fog;
     return v;
 }
 
@@ -1328,10 +1354,21 @@ uint64_t g_tris_clipped;
 
 static void queue_job(int pipe, const Vert *a, const Vert *b, const Vert *c, int sprite);
 
+/* Backface culling, on screen coordinates (y down). CULL=1 keeps triangles with
+ * a positive edge function, CULL=0 negative ones; in a strip every other
+ * triangle has the opposite winding, so `flip` swaps the rule (PPSSPP's
+ * SendTriangle, Rasterizer). */
+static inline int tri_visible(const Pipe *p, const Vert *a, const Vert *b, const Vert *c, int flip) {
+    if (!p->cull) return 1;
+    float area = edge(a->x, a->y, b->x, b->y, c->x, c->y);
+    return ((p->cull == 2) != (flip != 0)) ? area > 0.f : area < 0.f;
+}
+
 /* One 3D triangle (vertex indices). `flat` (provoking vertex) colours flat-shaded triangles. */
-static void tri3d(int pipe, int i0, int i1, int i2, const uint8_t *ok) {
+static void tri3d(int pipe, int i0, int i1, int i2, const uint8_t *ok, int flip) {
     if (ok[i0] && ok[i1] && ok[i2]) {
-        queue_job(pipe, &g_verts[i0], &g_verts[i1], &g_verts[i2], 0);
+        if (tri_visible(&g_pipes[pipe], &g_verts[i0], &g_verts[i1], &g_verts[i2], flip))
+            queue_job(pipe, &g_verts[i0], &g_verts[i1], &g_verts[i2], 0);
         return;
     }
     g_tris_clipped++;
@@ -1349,8 +1386,54 @@ static void tri3d(int pipe, int i0, int i1, int i2, const uint8_t *ok) {
     /* flat shading uses the last original vertex's colour */
     for (int k = 0; k < n; k++)
         if (!g_pipes[pipe].gouraud) { sv[k].r = in[2].r; sv[k].g = in[2].g; sv[k].b = in[2].b; sv[k].a = in[2].a; }
+    if (!tri_visible(&g_pipes[pipe], &sv[0], &sv[1], &sv[2], flip)) return;
     queue_job(pipe, &sv[0], &sv[1], &sv[2], 0);
     if (n == 4) queue_job(pipe, &sv[0], &sv[2], &sv[3], 0);
+}
+
+/* MKU_NO_LIGHTING=1: draw unlit, for comparison. */
+static int g_no_lighting;
+void gpu_set_no_lighting(int off) { g_no_lighting = off; }
+
+static void rgb_of(uint32_t c, float out[3]) {
+    out[0] = (c & 255) / 255.f; out[1] = ((c >> 8) & 255) / 255.f; out[2] = ((c >> 16) & 255) / 255.f;
+}
+
+/* The lights and material as set by the display list. */
+static void lighting_setup(GeLighting *g) {
+    memset(g, 0, sizeof *g);
+    for (int i = 0; i < 4; i++) {
+        GeLight *l = &g->l[i];
+        l->on = ge.cmd[GE_LIGHTENABLE0 + i] & 1;
+        if (!l->on) continue;
+        uint32_t t = ge.cmd[GE_LIGHTTYPE0 + i];
+        l->comp = t & 3;
+        l->type = (t >> 8) & 3;
+        for (int k = 0; k < 3; k++) {
+            l->pos[k] = ge_float(ge.cmd[GE_LX0 + 3 * i + k]);
+            l->dir[k] = ge_float(ge.cmd[GE_LDX0 + 3 * i + k]);
+            l->att[k] = ge_float(ge.cmd[GE_LKA0 + 3 * i + k]);
+        }
+        l->conv = ge_float(ge.cmd[0x87 + i]);     /* LKS */
+        l->cutoff = ge_float(ge.cmd[0x8B + i]);   /* LKO */
+        rgb_of(ge.cmd[GE_LAC0 + 3 * i], l->amb);
+        rgb_of(ge.cmd[GE_LAC0 + 3 * i + 1], l->dif);
+        rgb_of(ge.cmd[GE_LAC0 + 3 * i + 2], l->spe);
+    }
+    rgb_of(ge.cmd[GE_AMBIENTCOLOR], g->ambient);
+    g->ambient[3] = (ge.cmd[GE_AMBIENTALPHA] & 255) / 255.f;
+    rgb_of(ge.cmd[GE_MATERIALAMBIENT], g->mat_amb);
+    g->mat_amb[3] = (ge.cmd[GE_MATERIALALPHA] & 255) / 255.f;
+    rgb_of(ge.cmd[GE_MATERIALDIFFUSE], g->mat_dif);
+    rgb_of(ge.cmd[GE_MATERIALSPECULAR], g->mat_spe);
+    rgb_of(ge.cmd[GE_MATERIALEMISSIVE], g->mat_emi);
+    g->shininess = ge_float(ge.cmd[GE_MATERIALSPECULARCOEF]);
+    g->update = ge.cmd[GE_MATERIALUPDATE] & 7;
+    /* the view matrix's third row: the camera's z axis in world space */
+    float vd[3] = {ge.view[2], ge.view[5], ge.view[8]};
+    float len = sqrtf(vd[0] * vd[0] + vd[1] * vd[1] + vd[2] * vd[2]);
+    if (len > 0.f) { g->view_dir[0] = vd[0] / len; g->view_dir[1] = vd[1] / len; g->view_dir[2] = vd[2] / len; }
+    else g->view_dir[2] = 1.f;
 }
 
 static void draw_prim_impl(uint32_t data);
@@ -1367,8 +1450,14 @@ static void draw_prim_impl(uint32_t data) {
 
     Pipe p = setup_pipe();
     if (p.textured) g_texfmt[p.tex.fmt]++;
-    if (!f.through && (ge.cmd[GE_LIGHTINGENABLE] & 1)) WARN_ONCE(1, "lighting not implemented yet (drawn unlit)\n");
-    if (ge.cmd[GE_TEXMAPMODE] & 3) WARN_ONCE(2, "texture map mode %u not implemented\n", ge.cmd[GE_TEXMAPMODE] & 3);
+    int lit = !f.through && !p.clear && (ge.cmd[GE_LIGHTINGENABLE] & 1) && !g_no_lighting;
+    int uvgen = f.through || p.clear ? 0 : ge.cmd[GE_TEXMAPMODE] & 3;
+    int projmode = (ge.cmd[GE_TEXMAPMODE] >> 8) & 3;
+    int ls0 = ge.cmd[GE_TEXSHADELS] & 3, ls1 = (ge.cmd[GE_TEXSHADELS] >> 8) & 3;
+    int reverse_n = ge.cmd[GE_REVERSENORMAL] & 1;
+    static GeLighting lg;
+    if (lit || uvgen == 2) lighting_setup(&lg);
+    float fog1 = ge_float(ge.cmd[GE_FOG1]), fog2 = ge_float(ge.cmd[GE_FOG2]);
 
     float su = ge.cmd[GE_TEXSCALEU] ? ge_float(ge.cmd[GE_TEXSCALEU]) : 1.f;
     float sv = ge.cmd[GE_TEXSCALEV] ? ge_float(ge.cmd[GE_TEXSCALEV]) : 1.f;
@@ -1381,20 +1470,58 @@ static void draw_prim_impl(uint32_t data) {
         if (f.idx == 1) index = MEM_LBU(ge.iaddr + (uint32_t)i);
         else if (f.idx == 2) index = MEM_LHU(ge.iaddr + 2u * (uint32_t)i);
         else if (f.idx == 3) index = MEM_LW(ge.iaddr + 4u * (uint32_t)i);
-        float pos[3], uv[2];
+        float pos[3], uv[2], nrm[3], world[3], view_z = 0.f;
         Rgba col;
-        decode_vertex(&f, ge.vaddr + index * (uint32_t)(f.size * f.nmorph), pos, uv, &col);
+        decode_vertex(&f, ge.vaddr + index * (uint32_t)(f.size * f.nmorph), pos, uv, &col, nrm);
         Vert *v = &g_verts[i];
         if (f.through) {
             v->x = pos[0]; v->y = pos[1]; v->z = pos[2]; v->w = 1.f;
             v->u = uv[0]; v->v = uv[1];
+            v->fog = 1.f;
             ok[i] = 1;
         } else {
-            transform(pos, f.wt != 0, g_clip[i]);
+            transform(pos, f.wt != 0, g_clip[i], world, &view_z);
             ok[i] = g_clip[i][3] > NEAR_W;
             if (ok[i]) project(g_clip[i], v);
-            v->u = (uv[0] * su + ou) * (p.textured ? p.tex.w : 1);
-            v->v = (uv[1] * sv + ov) * (p.textured ? p.tex.h : 1);
+            v->fog = p.fog ? (view_z + fog1) * fog2 : 1.f;
+            float wn[3] = {0.f, 0.f, 0.f};
+            if (lit || uvgen) {
+                const float *w = ge.world;
+                float n0 = f.nrm ? nrm[0] : 0.f, n1 = f.nrm ? nrm[1] : 0.f, n2 = f.nrm ? nrm[2] : 1.f;
+                if (reverse_n) { n0 = -n0; n1 = -n1; n2 = -n2; }
+                for (int k = 0; k < 3; k++) wn[k] = n0 * w[k] + n1 * w[3 + k] + n2 * w[6 + k];
+            }
+            float s, t;
+            if (uvgen == 1) {   /* texture matrix: the source is multiplied by it, then s/q, t/q */
+                float src[3], o[3];
+                if (projmode == 0) memcpy(src, pos, sizeof src);
+                else if (projmode == 1) { src[0] = uv[0]; src[1] = uv[1]; src[2] = 0.f; }
+                else {
+                    src[0] = nrm[0]; src[1] = nrm[1]; src[2] = nrm[2];
+                    if (reverse_n) { src[0] = -src[0]; src[1] = -src[1]; src[2] = -src[2]; }
+                    if (projmode == 2) {
+                        float l = sqrtf(src[0] * src[0] + src[1] * src[1] + src[2] * src[2]);
+                        if (l > 0.f) { src[0] /= l; src[1] /= l; src[2] /= l; }
+                    }
+                }
+                mul43(ge.tgen, src, o);
+                float q = o[2] != 0.f ? o[2] : 1.f;
+                s = o[0] / q; t = o[1] / q;
+            } else if (uvgen == 2) {   /* environment map from two lights */
+                s = ge_shade_map_coord(&lg, ls0, world, wn);
+                t = ge_shade_map_coord(&lg, ls1, world, wn);
+            } else {
+                s = uv[0] * su + ou;
+                t = uv[1] * sv + ov;
+            }
+            v->u = s * (p.textured ? p.tex.w : 1);
+            v->v = t * (p.textured ? p.tex.h : 1);
+            if (lit) {
+                float c0[4] = {col.r / 255.f, col.g / 255.f, col.b / 255.f, col.a / 255.f}, o[4];
+                ge_light_vertex(&lg, world, wn, c0, f.col >= 4, o);
+                col.r = (int)(o[0] * 255.f + 0.5f); col.g = (int)(o[1] * 255.f + 0.5f);
+                col.b = (int)(o[2] * 255.f + 0.5f); col.a = (int)(o[3] * 255.f + 0.5f);
+            }
         }
         v->r = (float)col.r; v->g = (float)col.g; v->b = (float)col.b; v->a = (float)col.a;
     }
@@ -1420,18 +1547,15 @@ static void draw_prim_impl(uint32_t data) {
     switch (type) {
     case 3:   /* triangles */
         for (int i = 0; i + 2 < count; i += 3)
-            if (f.through) { if (ok[i] && ok[i + 1] && ok[i + 2]) queue_job(pi, &g_verts[i], &g_verts[i + 1], &g_verts[i + 2], 0); }
-            else tri3d(pi, i, i + 1, i + 2, ok);
+            tri3d(pi, i, i + 1, i + 2, ok, 0);
         break;
-    case 4:   /* strip */
+    case 4:   /* strip: every other triangle is wound the other way */
         for (int i = 0; i + 2 < count; i++)
-            if (f.through) { if (ok[i] && ok[i + 1] && ok[i + 2]) queue_job(pi, &g_verts[i], &g_verts[i + 1], &g_verts[i + 2], 0); }
-            else tri3d(pi, i, i + 1, i + 2, ok);
+            tri3d(pi, i, i + 1, i + 2, ok, i & 1);
         break;
     case 5:   /* fan */
         for (int i = 1; i + 1 < count; i++)
-            if (f.through) { if (ok[0] && ok[i] && ok[i + 1]) queue_job(pi, &g_verts[0], &g_verts[i], &g_verts[i + 1], 0); }
-            else tri3d(pi, 0, i, i + 1, ok);
+            tri3d(pi, 0, i, i + 1, ok, 0);
         break;
     case 6:   /* sprites */
         for (int i = 0; i + 1 < count; i += 2)

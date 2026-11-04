@@ -46,6 +46,7 @@ void surf_init(void) {
     if (e) g_scale = atoi(e);
     if (g_scale < 1) g_scale = 1;
     if (g_scale > 4) g_scale = 4;
+    if (getenv("MKU_NO_LIGHTING")) gpu_set_no_lighting(1);
     if (g_scale > 1) fprintf(stderr, "[gpu] rendering at %dx (%dx%d)\n", g_scale, 480 * g_scale, 272 * g_scale);
 }
 

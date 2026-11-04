@@ -166,7 +166,10 @@ static void run_list(GeList *l) {
             break;
         }
     }
-    gpu_flush();   /* the game may look at VRAM once we return */
+    /* Queued drawing stays queued: like the real GE, drawing is asynchronous, and
+     * the CPU must sync (sceGeDrawSync, sceGeListSync) before it looks at the result.
+     * The game feeds lists piecemeal through stall updates, so flushing here
+     * would mean dozens of tiny batches per frame. */
 }
 
 void gpu_stats_report(void) {
@@ -208,8 +211,8 @@ void hle_sceGeListUpdateStallAddr(Ctx *c) {
 }
 
 /* Lists finish synchronously, so syncing never has to wait. */
-void hle_sceGeListSync(Ctx *c) { RET(0); }   /* 0 = completed */
-void hle_sceGeDrawSync(Ctx *c) { RET(0); }
+void hle_sceGeListSync(Ctx *c) { gpu_flush(); RET(0); }   /* 0 = completed */
+void hle_sceGeDrawSync(Ctx *c) { gpu_flush(); RET(0); }
 void hle_sceGeBreak(Ctx *c) { RET(0); }
 void hle_sceGeContinue(Ctx *c) { RET(0); }
 

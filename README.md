@@ -1,15 +1,72 @@
-# mku-port
+# Mortal Kombat: Unchained, native
 
-A learning project: a **native** port of *Mortal Kombat: Unchained* (PSP, 2006 —
-the handheld version of *MK: Deception*, internal module name `MK6`) to macOS,
-then Windows, then Nintendo Switch homebrew.
+Play *Mortal Kombat: Unchained* (PSP, 2006) as a native program on a modern
+computer, from your own copy of the game. This is **not an emulator**: the game's
+code is translated to C and compiled for your machine.
 
-Approach: **static recompilation** (translate the game's MIPS machine code to C
-ahead of time, like N64Recomp / XenonRecomp), plus a runtime that reimplements
-the PSP system functions the game calls. Later, recompiled functions get
-replaced by hand-decompiled C, one at a time.
+Remastered: 60 fps fights, up to 4x resolution, smoother textures, a free camera.
 
-No game data is in this repo. Everything is generated from your own dump.
+**This repository contains no game code or data.** You need your own disc image.
+
+## Play
+
+```sh
+./mku-play "Mortal Kombat - Unchained (USA).iso"
+```
+
+On a Mac you can also double-click **Play MK Unchained.command**.
+
+The first run checks your ISO, tells you the install command if a free tool is
+missing, then translates the game for your computer (about a minute). After that
+it starts right away and remembers your ISO. You need:
+
+- The US version, ULUS-10102 v1.03, as a plain `.iso` (not CSO). Other versions are refused.
+- macOS: `xcode-select --install`, then `brew install sdl2 ffmpeg`.
+- Linux (should work, not tested yet): `sudo apt install make clang libsdl2-dev pkg-config libavcodec-dev libavutil-dev`.
+
+### Controls
+
+| | Keyboard | Game controller |
+|---|---|---|
+| Move | Arrows | D-pad / left stick |
+| Cross / Circle / Square / Triangle | Z / X / A / S | Same buttons |
+| L / R | Q / W | Shoulders, triggers |
+| Start / Select | Enter / Right Shift | Options / Share |
+| Camera: rotate | T F G H | Right stick |
+| Camera: zoom | R / Y | Hold R3, move right stick |
+| Camera: reset | C | L3 |
+| Quit | Esc | |
+
+### Graphics
+
+| Key | Option | Values |
+|---|---|---|
+| F1 | Texture upscaling (xBRZ) | Original, 2x, 4x |
+| F2 | Resolution | 480x272, 960x544 (default), 1440x816, 1920x1088 |
+| F3 | Window scaling | Smooth, sharp |
+
+The window title shows the current settings and frame rate. Settings stay in
+`mku.ini`. If the frame rate drops, lower the resolution with F2.
+`./mku-play --scale 3 --textures 2` sets them from the command line.
+
+### Texture packs
+
+`MKU_TEXDUMP=1 ./mku-play` saves every texture the game shows to `build/texdump/`.
+Upscale them however you like, keep the file names, and make each one 2, 4 or 8
+times the original size. Load the folder with `./mku-play --pack my_textures/`.
+
+### Known gaps
+
+Intro movies are skipped, and there's no sound reverb. Saves are in `saves/`.
+
+---
+
+# For developers
+
+A learning project: a port of the game (internal module name `MK6`) by **static
+recompilation**: translate the MIPS machine code to C ahead of time, like
+N64Recomp or XenonRecomp, plus a runtime that reimplements the PSP system
+functions the game calls. Start with [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Setup
 

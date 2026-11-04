@@ -1,22 +1,22 @@
-/* Fiber switch for AArch64 (Apple Silicon Macs, Nintendo Switch, ARM Linux).
+/* Fiber switch for AArch64 (Apple Silicon Macs, Nintendo Switch, ARM Linux)
+ * and x86-64 (Intel Macs, Linux PCs: System V calling convention).
  *
  * The AAPCS64 calling convention says a called function must preserve
- * x19-x28, x29 (frame pointer), x30 (link register), sp and d8-d15. So a
- * switch only needs to push those, swap sp, and pop the other fiber's. */
+ * x19-x28, x29 (frame pointer), x30 (link register), sp and d8-d15; System V
+ * x86-64 says rbx, rbp, r12-r15 and rsp. So a switch only needs to push those,
+ * swap the stack pointer, and pop the other fiber's. */
 #include "fiber.h"
 
 #include <stdint.h>
 #include <string.h>
-
-#if !defined(__aarch64__)
-#error "fiber.c: only AArch64 is implemented so far (an x86-64 version is needed for Windows/Linux PCs)"
-#endif
 
 #ifdef __APPLE__
 #define SYM(name) "_" #name
 #else
 #define SYM(name) #name
 #endif
+
+#if defined(__aarch64__)
 
 #define FRAME 160   /* 10 GPR pairs/FPR pairs * 16 bytes */
 
@@ -70,3 +70,50 @@ void fiber_init(Fiber *f, void *stack, size_t size, void (*fn)(void *), void *ar
     frame[11] = (uint64_t)(uintptr_t)fiber_trampoline;  /* x30: "return" into the trampoline */
     f->sp = frame;
 }
+
+#elif defined(__x86_64__)
+
+__asm__(
+    ".text\n"
+    ".globl " SYM(fiber_switch) "\n"
+    ".p2align 4\n"
+    SYM(fiber_switch) ":\n"           /* rdi = from, rsi = to */
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq %rsp, (%rdi)\n"         /* from->sp = rsp */
+    "    movq (%rsi), %rsp\n"         /* rsp = to->sp */
+    "    popq %r15\n"
+    "    popq %r14\n"
+    "    popq %r13\n"
+    "    popq %r12\n"
+    "    popq %rbx\n"
+    "    popq %rbp\n"
+    "    ret\n"
+
+    ".p2align 4\n"
+    SYM(fiber_trampoline) ":\n"       /* first run of a fiber: r12 = fn, r13 = arg */
+    "    movq %r13, %rdi\n"
+    "    call *%r12\n"
+    "    ud2\n");                     /* fn must not return */
+
+extern void fiber_trampoline(void);
+
+void fiber_init(Fiber *f, void *stack, size_t size, void (*fn)(void *), void *arg) {
+    /* r15 r14 r13 r12 rbx rbp, then the return address. After the ret, rsp must
+     * be 16-byte aligned so that the trampoline's call meets the ABI. */
+    uintptr_t top = ((uintptr_t)stack + size) & ~(uintptr_t)15;
+    uint64_t *frame = (uint64_t *)(top - 72);
+    memset(frame, 0, 72);
+    frame[2] = (uint64_t)(uintptr_t)arg;               /* r13 */
+    frame[3] = (uint64_t)(uintptr_t)fn;                /* r12 */
+    frame[6] = (uint64_t)(uintptr_t)fiber_trampoline;  /* "return" into the trampoline */
+    f->sp = frame;
+}
+
+#else
+#error "fiber.c: this CPU isn't supported yet (AArch64 and x86-64 are)"
+#endif

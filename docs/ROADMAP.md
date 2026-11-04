@@ -76,28 +76,28 @@ Unnamed `func_001DD210` everywhere is miserable. Recover names first.
   legal screen; movie playback (`sceMpeg*`) still stubbed.
 - Debug tools: `MKU_TRACE=1`, `MKU_TIMEOUT=N`, automatic hang report.
 
-## Phase 8 — Graphics (the big one) ⬜
-The game sends **GE display lists** (command buffers) via `sceGeListEnQueue`.
-- Write a GE command interpreter → OpenGL via SDL2.
-- Order: clear screen → 2D textured quads (menus) → 3D with transforms →
-  texture formats (CLUT/swizzled) → lighting → blending.
-- Reference: PPSSPP `GPU/GPUCommon.cpp`, `GPU/ge_constants.h`, pspsdk `pspgu.h`.
-- **Checkpoint:** title screen visible.
+## Phase 8 — Graphics ✅ → [lesson 08](lessons/08-graphics-and-audio.md)
+- GE command interpreter and a software renderer: textures (CLUT, swizzled),
+  blending, stencil, depth, lighting, fog, culling, near-plane clipping, texgen.
+- Not yet: mipmaps, splines, logic ops, dithering.
+- **Checkpoint:** title screen, menus and fights visible. ✅
 
-## Phase 9 — Audio and video ⬜
-- `sceSasCore`: a voice mixer for VAG (PSP ADPCM) samples — sound effects, music.
-- `sceAtrac3plus`: compressed music → decode with FFmpeg's atrac3plus decoder.
-- `sceMpeg`: `.PMF` intro movies → FFmpeg H.264.
-- **Checkpoint:** menu music plays.
+## Phase 9 — Audio and video 🟡 → [lesson 08](lessons/08-graphics-and-audio.md)
+- `sceSasCore` (effects) and `sceAtrac3plus` (music via FFmpeg). ✅ No reverb yet.
+- `sceMpeg`: `.PMF` movies are still skipped through the real API. ⬜
+- **Checkpoint:** menu music plays. ✅
 
-## Phase 10 — Playable on Mac ⬜
-- Input (`sceCtrl`) → keyboard/gamepad via SDL.
-- Saves (`sceUtilitySavedata*`) → files in a save folder.
-- Ad-hoc multiplayer (`sceNetAdhoc*`) → stubbed (returns "no network").
-- **Checkpoint:** a full fight from select screen to victory.
+## Phase 10 — Playable on Mac ✅ → [lesson 08](lessons/08-graphics-and-audio.md)
+- Input (keyboard, game controller), saves, ad-hoc stubbed.
+- **Checkpoint:** a 10-minute scripted run plays through 6+ ladder fights. ✅
+
+## Phase 10b — Remaster and player tool ✅ → [lesson 09](lessons/09-remaster.md)
+- 60 fps fights, 2x-4x resolution, xBRZ textures, texture packs, free camera.
+- `./mku-play game.iso`: builds from the player's own ISO, ships no game data.
 
 ## Phase 11 — Windows and Switch ⬜
-- Windows: same C code, build with clang-cl or MinGW, SDL2.
+- Fibers already support x86-64 (System V): Linux and Intel Macs should build; untested.
+- Windows: same C code, build with clang-cl or MinGW, SDL2; needs a Win64 fiber switch.
 - Switch: devkitPro + libnx, SDL2 for Switch, OpenGL via mesa (or deko3d).
   Memory: Switch has 4 GiB, PSP game needs 32 MiB — easy.
 - **Checkpoint:** runs on your Switch from the homebrew menu.

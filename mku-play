@@ -1,0 +1,264 @@
+#!/usr/bin/env -S python3 -I
+"""Play Mortal Kombat: Unchained natively, from your own disc image.
+
+    ./mku-play "Mortal Kombat - Unchained (USA).iso"
+
+This repository holds no game code or data. The first run reads the game's
+executable from your ISO, checks that it is the supported version, translates
+it to C, and compiles it for your computer (about a minute). Later runs start
+straight away; the game's files are read from your ISO while you play.
+
+    ./mku-play                remember and reuse the last ISO (asks on a Mac)
+    ./mku-play --check GAME   only verify the ISO, build nothing
+    ./mku-play --build GAME   verify and build, don't start the game
+    ./mku-play --scale 3 --textures 4 GAME   options for this and later runs
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import struct
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+BUILD_ELF = os.path.join("build", "game", "BOOT.elf")
+LAST_ISO = os.path.join("build", "game", "last_iso.txt")
+SAVES = "saves"
+INI = "mku.ini"
+
+SECTOR = 2048
+EXE_PATH = "PSP_GAME/SYSDIR/BOOT.BIN"
+SFO_PATH = "PSP_GAME/PARAM.SFO"
+
+# The recompiler's patches address this exact executable, so only it can work.
+SUPPORTED = {
+    "c4266d1f3aaa2ff77b065b3b0e3f35c2d2534fc207a0d69cb4fd2b7484168b08":
+        "Mortal Kombat: Unchained (USA, ULUS-10102, v1.03)",
+}
+
+
+class IsoError(Exception):
+    """The file can't be used; the message tells the player why."""
+
+
+# ---------------------------------------------------------------------------
+# reading the disc image: just enough ISO 9660
+
+def _dir_entries(f, lba, size):
+    f.seek(lba * SECTOR)
+    data = f.read(size)
+    i = 0
+    while i < len(data):
+        n = data[i]
+        if n == 0:   # records don't cross sectors: skip to the next one
+            i = (i // SECTOR + 1) * SECTOR
+            continue
+        rec = data[i:i + n]
+        if len(rec) < 34:
+            break
+        name = rec[33:33 + rec[32]].decode("ascii", "replace").split(";")[0]
+        yield name.upper(), struct.unpack_from("<I", rec, 2)[0], struct.unpack_from("<I", rec, 10)[0], bool(rec[25] & 2)
+        i += n
+
+
+def read_iso_file(f, path):
+    """The contents of `path` inside the ISO, or None if it isn't there."""
+    f.seek(16 * SECTOR)
+    pvd = f.read(SECTOR)
+    if len(pvd) < SECTOR or pvd[1:6] != b"CD001":
+        raise IsoError("this isn't an ISO disc image")
+    lba = struct.unpack_from("<I", pvd, 156 + 2)[0]
+    size = struct.unpack_from("<I", pvd, 156 + 10)[0]
+    parts = path.upper().split("/")
+    for depth, part in enumerate(parts):
+        for name, e_lba, e_size, is_dir in _dir_entries(f, lba, size):
+            if name == part and is_dir == (depth < len(parts) - 1):
+                lba, size = e_lba, e_size
+                break
+        else:
+            return None
+    f.seek(lba * SECTOR)
+    return f.read(size)
+
+
+def sfo_field(sfo, key):
+    """A text field of a PSP PARAM.SFO, or None."""
+    if not sfo or sfo[:4] != b"\0PSF" or len(sfo) < 20:
+        return None
+    keys, vals, count = struct.unpack_from("<III", sfo, 8)
+    for i in range(count):
+        kofs, _fmt, vlen, _vmax, vofs = struct.unpack_from("<HHIII", sfo, 20 + 16 * i)
+        name = sfo[keys + kofs:].split(b"\0", 1)[0].decode("ascii", "replace")
+        if name == key:
+            return sfo[vals + vofs:vals + vofs + vlen].split(b"\0", 1)[0].decode("ascii", "replace")
+    return None
+
+
+def load_game(iso_path):
+    """Check the ISO; returns (executable bytes, description). Raises IsoError."""
+    try:
+        f = open(iso_path, "rb")
+    except OSError as e:
+        raise IsoError(f"can't open it: {e.strerror}")
+    with f:
+        head = f.read(4)
+        if head in (b"CISO", b"ZISO"):
+            raise IsoError("this is a compressed image (CSO/ZSO). Convert it to a plain .iso first.")
+        exe = read_iso_file(f, EXE_PATH)
+        sfo = read_iso_file(f, SFO_PATH)
+    if exe is None:
+        raise IsoError("this isn't a PSP game disc (no PSP_GAME/SYSDIR/BOOT.BIN)")
+    disc_id = sfo_field(sfo, "DISC_ID") or "unknown"
+    if not exe.strip(b"\0"):
+        raise IsoError("this dump's BOOT.BIN is blank. Some dumps remove it; please dump your disc again unmodified.")
+    digest = hashlib.sha256(exe).hexdigest()
+    if digest not in SUPPORTED:
+        raise IsoError(f"unsupported game or version (disc id {disc_id}, BOOT.BIN sha-256 {digest[:16]}...).\n"
+                       "Supported: " + "; ".join(SUPPORTED.values()))
+    return exe, SUPPORTED[digest]
+
+
+# ---------------------------------------------------------------------------
+# what's needed on this computer
+
+def missing_tools():
+    """A list of (what's missing, the command that installs it)."""
+    missing = []
+    mac = sys.platform == "darwin"
+    for tool in ("make", "clang"):
+        if not shutil.which(tool):
+            missing.append((tool, "xcode-select --install" if mac else "sudo apt install make clang"))
+    if not shutil.which("sdl2-config"):
+        missing.append(("SDL2", "brew install sdl2" if mac else "sudo apt install libsdl2-dev"))
+    if mac:
+        ok = False
+        if shutil.which("brew"):
+            r = subprocess.run(["brew", "--prefix", "ffmpeg"], capture_output=True, text=True)
+            ok = r.returncode == 0 and os.path.exists(os.path.join(r.stdout.strip(), "include/libavcodec/avcodec.h"))
+        if not ok:
+            missing.append(("FFmpeg", "brew install ffmpeg"))
+    else:
+        r = subprocess.run(["pkg-config", "--exists", "libavcodec", "libavutil"], capture_output=True) \
+            if shutil.which("pkg-config") else None
+        if not r or r.returncode:
+            missing.append(("FFmpeg", "sudo apt install pkg-config libavcodec-dev libavutil-dev"))
+    return missing
+
+
+def fetch_third_party():
+    needed = ("third_party/PSPLibDoc.xml", "third_party/xbrz/xbrz.cpp", "third_party/stb/stb_image.h")
+    if all(os.path.exists(p) for p in needed):
+        return
+    print("Downloading open-source helper data and libraries (PSP function names, xBRZ, stb)...")
+    subprocess.run(["sh", "tools/fetch_third_party.sh"], check=True, stdout=subprocess.DEVNULL)
+
+
+def build(exe):
+    """Recompile the game if needed; make does nothing when it's up to date."""
+    os.makedirs(os.path.dirname(BUILD_ELF), exist_ok=True)
+    have = None
+    if os.path.exists(BUILD_ELF):
+        with open(BUILD_ELF, "rb") as f:
+            have = f.read()
+    if have != exe:
+        with open(BUILD_ELF, "wb") as f:
+            f.write(exe)
+    if not os.path.exists("build/mku"):
+        print("First run: translating the game for this computer. This takes about a minute...")
+    r = subprocess.run(["make", f"-j{os.cpu_count() or 4}", "game", f"ELF={BUILD_ELF}"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.stdout.write(r.stdout[-2000:])
+        sys.stderr.write(r.stderr[-2000:])
+        sys.exit("The build failed; the messages above say why.")
+
+
+# ---------------------------------------------------------------------------
+
+def choose_iso(arg):
+    if arg:
+        return arg
+    if os.path.exists(LAST_ISO):
+        with open(LAST_ISO) as f:
+            last = f.read().strip()
+        if os.path.exists(last):
+            return last
+    if sys.platform == "darwin" and sys.stdin.isatty():
+        r = subprocess.run(["osascript", "-e", 'POSIX path of (choose file with prompt '
+                            '"Choose your Mortal Kombat: Unchained ISO")'], capture_output=True, text=True)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    sys.exit('Tell me where your game is:  ./mku-play "path/to/game.iso"')
+
+
+def write_settings(scale, textures):
+    """Update mku.ini; the game reads it at startup and F1-F3 change it in game."""
+    vals = {}
+    if os.path.exists(INI):
+        with open(INI) as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    vals[k] = v
+    if scale is not None:
+        vals["scale"] = str(scale)
+    if textures is not None:
+        vals["texscale"] = str(textures)
+    with open(INI, "w") as f:
+        f.write("# Mortal Kombat: Unchained (native port) settings. F1/F2/F3 in game change them.\n")
+        for k, v in vals.items():
+            f.write(f"{k}={v}\n")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Play Mortal Kombat: Unchained natively from your own ISO.")
+    ap.add_argument("iso", nargs="?", help="your disc image (.iso); remembered for next time")
+    ap.add_argument("--check", action="store_true", help="only verify the ISO")
+    ap.add_argument("--build", action="store_true", help="verify and build, don't start the game")
+    ap.add_argument("--scale", type=int, choices=[1, 2, 3, 4], help="rendering resolution (2 = 960x544)")
+    ap.add_argument("--textures", type=int, choices=[1, 2, 4], help="xBRZ texture upscaling (1 = original)")
+    ap.add_argument("--pack", metavar="DIR", help="a texture pack folder (<hash>.png files)")
+    args = ap.parse_args(argv)
+
+    start_dir = os.getcwd()
+    iso = choose_iso(args.iso)
+    iso = os.path.abspath(os.path.join(start_dir, iso))
+    pack = os.path.abspath(os.path.join(start_dir, args.pack)) if args.pack else None
+    os.chdir(ROOT)
+
+    try:
+        exe, title = load_game(iso)
+    except IsoError as e:
+        sys.exit(f"{iso}:\n{e}")
+    print(f"Found: {title}")
+    if args.check:
+        return 0
+
+    missing = missing_tools()
+    if missing:
+        print("A few free tools are needed first. Run:")
+        for name, cmd in missing:
+            print(f"    {cmd}    # {name}")
+        sys.exit(1)
+
+    fetch_third_party()
+    build(exe)
+    with open(LAST_ISO, "w") as f:
+        f.write(iso)
+    if args.scale or args.textures:
+        write_settings(args.scale, args.textures)
+    if args.build:
+        print("Built. Start it with ./mku-play")
+        return 0
+
+    env = dict(os.environ, MKU_ISO=iso, MKU_MS=os.path.join(ROOT, SAVES))
+    if pack:
+        env["MKU_TEXPACK"] = pack
+    print("Controls: arrows = move, Z/X/A/S = cross/circle/square/triangle, Q/W = L/R, Enter = start, Esc = quit.\n"
+          "A game controller works too. Camera: right stick, or T F G H. F1 textures, F2 resolution, F3 sharp.")
+    return subprocess.call(["build/mku", "build/recomp/image.bin"], env=env)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -118,19 +118,34 @@ void host_submit_frame(const uint32_t *rgba, int w, int h) {
 extern uint64_t display_frame_count(void);
 
 static uint32_t scripted_buttons(void) {
-    static const char *script = (const char *)-1;
-    if (script == (const char *)-1) script = getenv("MKU_PRESS");
-    if (!script) return 0;
-    uint64_t f = display_frame_count();
-    uint32_t b = 0;
-    for (const char *s = script; *s;) {
-        unsigned long long from, to;
-        unsigned bits;
-        if (sscanf(s, "%llu-%llu:%x", &from, &to, &bits) == 3 && f >= from && f <= to) b |= bits;
-        s += strcspn(s, ",");
-        if (*s) s++;
+    static struct Press { uint64_t from, to; uint32_t bits; } *press;
+    static int npress = -1;
+    if (npress < 0) {   /* parsed once: scripts can be long, and this runs on every input read */
+        npress = 0;
+        const char *script = getenv("MKU_PRESS");
+        for (const char *s = script; s && *s;) {
+            unsigned long long from, to;
+            unsigned bits;
+            if (sscanf(s, "%llu-%llu:%x", &from, &to, &bits) == 3) {
+                press = realloc(press, sizeof *press * (size_t)(npress + 1));
+                press[npress++] = (struct Press){from, to, bits};
+            }
+            const char *comma = strchr(s, ',');
+            if (!comma) break;
+            s = comma + 1;
+        }
     }
-    return b;
+    if (!npress) return 0;
+    static uint64_t cached_frame = (uint64_t)-1;
+    static uint32_t cached;
+    uint64_t f = display_frame_count();
+    if (f != cached_frame) {
+        cached_frame = f;
+        cached = 0;
+        for (int i = 0; i < npress; i++)
+            if (f >= press[i].from && f <= press[i].to) cached |= press[i].bits;
+    }
+    return cached;
 }
 
 uint32_t host_buttons(void) { return atomic_load(&g_buttons) | scripted_buttons(); }

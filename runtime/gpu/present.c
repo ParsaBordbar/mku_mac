@@ -122,6 +122,7 @@ extern int g_dump_draws;
 void raster_bench_report(void);
 
 void present_frame_shown(uint64_t frame) {
+    gpu_flush();   /* a swap without a sync still shows everything drawn so far */
     fps_stats();
     static long dump_at = -2;
     if (dump_at == -2) dump_at = getenv("MKU_GE_DUMP") ? atol(getenv("MKU_GE_DUMP")) : -1;

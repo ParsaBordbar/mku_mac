@@ -41,6 +41,8 @@ void gpu_frame_end(void);                 /* once per shown frame (free camera b
 void gpu_stats_report(void);   /* ge.c: command counts (MKU_GE_STATS=1) */
 void gpu_draw_report(void);    /* raster.c */
 
+void gpu_set_no_lighting(int off);        /* raster.c: MKU_NO_LIGHTING */
+
 /* surface.c: high-resolution twins of the render targets (MKU_SCALE) */
 extern int g_scale;
 void surf_init(void);

@@ -209,6 +209,7 @@ void rt_syscall(Ctx *c, uint32_t pc, uint32_t code);
 void rt_unimplemented(Ctx *c, uint32_t pc, uint32_t word, const char *op);
 void rt_hle_unimplemented(Ctx *c, const char *name);
 void rt_hle_report(void);
+void rt_thread_high_priority(void);                    /* ask the OS for the fast CPU cores */
 void rt_crash_dump(Ctx *c);                               /* registers + RAM to build/crash/ */                                /* summary of unimplemented HLE calls */
 
 /* ---- setup ---- */

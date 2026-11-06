@@ -6,7 +6,15 @@ code is translated to C and compiled for your machine.
 
 Remastered: 60 fps fights, up to 4x resolution, smoother textures, a free camera.
 
-**This repository contains no game code or data.** You need your own disc image.
+## No piracy: bring your own game
+
+**We do not provide, host or link to any game files, and we do not support piracy.**
+
+You must own the game and use an ISO made from your own copy. This repository
+contains only our own tools and runtime: no game code, no game data, and no
+pre-built version of the game. Everything game-related is generated on your
+computer, from your ISO. Please don't share game files, ISOs or built copies of
+the game, and don't ask for them here.
 
 ## Play
 
@@ -57,7 +65,12 @@ times the original size. Load the folder with `./mku-play --pack my_textures/`.
 
 ### Known gaps
 
-Intro movies are skipped, and there's no sound reverb. Saves are in `saves/`.
+- Intro movies are skipped, and there's no sound reverb.
+- Pressing F1 or F2 during a fight has made the stage background turn flat brown.
+  Your choice is saved, so restarting the game fixes it.
+- Only tested on an Apple Silicon Mac so far.
+
+Saves are in `saves/`.
 
 ---
 

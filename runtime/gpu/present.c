@@ -138,9 +138,21 @@ void present_frame_shown(uint64_t frame) {
         nframes++;
         if (t - sec_start >= 1000000u) { host_report_fps((int)nframes); nframes = 0; sec_start = t; }
     }
-    static long tex_off_at = -2;
-    if (tex_off_at == -2) tex_off_at = getenv("MKU_TEXSCALE_OFF_AT") ? atol(getenv("MKU_TEXSCALE_OFF_AT")) : -1;
-    if ((long)frame == tex_off_at) { texpack_set_upscale(1); gpu_texture_cache_clear(); }
+    {   /* MKU_SET_AT="frame:scale:textures,..." does what the F1/F2 keys do, for tests */
+        static const char *script = (const char *)-1;
+        if (script == (const char *)-1) script = getenv("MKU_SET_AT");
+        for (const char *q = script; q && *q;) {
+            unsigned long long at;
+            int sc, tx;
+            if (sscanf(q, "%llu:%d:%d", &at, &sc, &tx) == 3 && at == frame) {
+                surf_set_scale(sc);
+                texpack_set_upscale(tx);
+                gpu_texture_cache_clear();
+            }
+            q = strchr(q, ',');
+            if (q) q++;
+        }
+    }
     gpu_frame_end();
     raster_bench_report();
     surf_frame_end();

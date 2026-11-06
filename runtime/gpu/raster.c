@@ -1535,10 +1535,11 @@ static void draw_prim_impl(uint32_t data) {
         float zmin = 1e9f, zmax = -1e9f;
         int vis = 0;
         for (int i = 0; i < count; i++) if (ok[i]) { vis++; zmin = fminf(zmin, g_verts[i].z); zmax = fmaxf(zmax, g_verts[i].z); }
-        fprintf(stderr, "[draw] fbfmt=%d type=%d n=%d vis=%d vt=%06X %s fb=%08X tex=%s%08X fmt=%d %dx%d func=%d at=%d/%d,%d zt=%d/%d zw=%d bl=%d(%X,%X,%d) st=%d mask=%08X z=%.0f..%.0f x0=%.0f y0=%.0f\n",
+        fprintf(stderr, "[draw] fbfmt=%d type=%d n=%d vis=%d vt=%06X %s fb=%08X tex=%s%08X fmt=%d %dx%d func=%d at=%d/%d,%d zt=%d/%d zw=%d bl=%d(%X,%X,%d) st=%d mask=%08X z=%.0f..%.0f x0=%.0f y0=%.0f fog=%d f1=%g f2=%g fogv0=%g col=%08X\n",
                 p.fb_fmt, type, count, vis, vt, f.through ? "2D" : "3D", p.fb, p.textured ? "" : "-", p.textured ? p.tex.addr : 0,
                 p.tex.fmt, p.tex.w, p.tex.h, p.tex_func, p.alpha_test, p.at_func, p.at_ref, p.depth_test, p.z_func, p.z_write,
-                p.blend, p.bl_a, p.bl_b, p.bl_eq, p.stencil_test, p.write_mask, zmin, zmax, g_verts[0].x, g_verts[0].y);
+                p.blend, p.bl_a, p.bl_b, p.bl_eq, p.stencil_test, p.write_mask, zmin, zmax, g_verts[0].x, g_verts[0].y,
+                p.fog, ge_float(ge.cmd[GE_FOG1]), ge_float(ge.cmd[GE_FOG2]), g_verts[0].fog, ge.cmd[GE_FOGCOLOR]);
     }
     if (!f.through) {
         g_draws_3d++;

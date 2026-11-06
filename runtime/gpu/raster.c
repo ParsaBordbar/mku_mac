@@ -522,7 +522,9 @@ static Pipe setup_pipe(void) {
     p.tex_alpha = (ge.cmd[GE_TEXFUNC] >> 8) & 1;
     p.tex_double = (ge.cmd[GE_TEXFUNC] >> 16) & 1;
     p.env = unpack(ge.cmd[GE_TEXENVCOLOR] | 0xFF000000u, 3);
-    p.alpha_test = !p.clear && (ge.cmd[GE_ALPHATESTENABLE] & 1);
+    static int no_at = -1;
+    if (no_at < 0) no_at = getenv("MKU_NO_ALPHATEST") != NULL;   /* for comparison */
+    p.alpha_test = !no_at && !p.clear && (ge.cmd[GE_ALPHATESTENABLE] & 1);
     p.at_func = ge.cmd[GE_ALPHATEST] & 7;
     p.at_ref = (ge.cmd[GE_ALPHATEST] >> 8) & 0xFF;
     p.at_mask = (ge.cmd[GE_ALPHATEST] >> 16) & 0xFF;
@@ -556,9 +558,13 @@ static Pipe setup_pipe(void) {
         p.sx2 = (p.sx2 + 1) * n - 1; p.sy2 = (p.sy2 + 1) * n - 1;
     }
     p.fast_blend = p.blend && p.bl_a == 2 && p.bl_b == 3 && p.bl_eq == 0;
-    p.fog = !p.clear && (ge.cmd[GE_FOGENABLE] & 1);
+    static int no_fog = -1;
+    if (no_fog < 0) no_fog = getenv("MKU_NO_FOG") != NULL;   /* for comparison */
+    p.fog = !p.clear && (ge.cmd[GE_FOGENABLE] & 1) && !no_fog;
     p.fog_color = unpack(ge.cmd[GE_FOGCOLOR] | 0xFF000000u, 3);
-    p.cull = !p.clear && (ge.cmd[GE_CULLFACEENABLE] & 1) ? 1 + (ge.cmd[GE_CULL] & 1) : 0;
+    static int no_cull = -1;
+    if (no_cull < 0) no_cull = getenv("MKU_NO_CULL") != NULL;   /* for comparison */
+    p.cull = !no_cull && !p.clear && (ge.cmd[GE_CULLFACEENABLE] & 1) ? 1 + (ge.cmd[GE_CULL] & 1) : 0;
     return p;
 }
 
@@ -1530,16 +1536,33 @@ static void draw_prim_impl(uint32_t data) {
     if (f.idx) ge.iaddr += (uint32_t)count * (f.idx == 1 ? 1u : f.idx == 2 ? 2u : 4u);
     else ge.vaddr += (uint32_t)(count * f.size * f.nmorph);
 
+    static int skip_lm = -1;
+    if (skip_lm < 0) skip_lm = getenv("MKU_SKIP_LIGHTMAP") != NULL;   /* for comparison */
+    if (skip_lm && p.blend && p.bl_a == 10 && p.bl_b == 2) { free(ok); return; }
     int pi = type >= 3 && type <= 6 ? queue_pipe(&p) : -1;
+    static int rtt_logged;
+    if (getenv("MKU_RTTLOG") && p.textured && (p.tex.addr & 0x0FE00000u) == VRAM_BASE && rtt_logged++ < 6) {
+        fprintf(stderr, "[rtt] lit=%d(enable %u) texmap=%06X shadels=%06X func=%d tex_alpha=%d col0=(%g,%g,%g,%g) matamb=%06X a=%02X matdif=%06X emi=%06X ambient=%06X a=%02X update=%u clamp=%d/%d filter=%d uv0=(%g,%g) uv1=(%g,%g) uv2=(%g,%g) w0=%g tgen=%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g\n",
+                lit, ge.cmd[GE_LIGHTINGENABLE] & 1, ge.cmd[GE_TEXMAPMODE], ge.cmd[GE_TEXSHADELS], p.tex_func, p.tex_alpha,
+                g_verts[0].r, g_verts[0].g, g_verts[0].b, g_verts[0].a, ge.cmd[GE_MATERIALAMBIENT], ge.cmd[GE_MATERIALALPHA] & 255,
+                ge.cmd[GE_MATERIALDIFFUSE], ge.cmd[GE_MATERIALEMISSIVE], ge.cmd[GE_AMBIENTCOLOR], ge.cmd[GE_AMBIENTALPHA] & 255,
+                ge.cmd[GE_MATERIALUPDATE] & 7, p.tex.clamp_u, p.tex.clamp_v, p.tex.linear,
+                g_verts[0].u, g_verts[0].v, g_verts[1].u, g_verts[1].v, g_verts[2].u, g_verts[2].v, g_verts[0].w,
+                ge.tgen[0], ge.tgen[1], ge.tgen[2], ge.tgen[3], ge.tgen[4], ge.tgen[5], ge.tgen[6], ge.tgen[7], ge.tgen[8], ge.tgen[9], ge.tgen[10], ge.tgen[11]);
+        const uint32_t *px = p.tex.px;
+        fprintf(stderr, "[rtt] texels: corner %08X center %08X edge %08X\n", px[0], px[p.tex.ph / 2 * p.tex.pw + p.tex.pw / 2], px[p.tex.pw / 2]);
+    }
     if (g_dump_draws) {   /* MKU_GE_DUMP=frame: one line per draw of that frame */
         float zmin = 1e9f, zmax = -1e9f;
         int vis = 0;
         for (int i = 0; i < count; i++) if (ok[i]) { vis++; zmin = fminf(zmin, g_verts[i].z); zmax = fmaxf(zmax, g_verts[i].z); }
-        fprintf(stderr, "[draw] fbfmt=%d type=%d n=%d vis=%d vt=%06X %s fb=%08X tex=%s%08X fmt=%d %dx%d func=%d at=%d/%d,%d zt=%d/%d zw=%d bl=%d(%X,%X,%d) st=%d mask=%08X z=%.0f..%.0f x0=%.0f y0=%.0f fog=%d f1=%g f2=%g fogv0=%g col=%08X\n",
+        fprintf(stderr, "[draw] fbfmt=%d type=%d n=%d vis=%d vt=%06X %s fb=%08X tex=%s%08X fmt=%d %dx%d func=%d at=%d/%d,%d zt=%d/%d zw=%d bl=%d(%X,%X,%d) st=%d mask=%08X z=%.0f..%.0f x0=%.0f y0=%.0f fog=%d f1=%g f2=%g fogv0=%g col=%08X lit=%d rgba0=%g,%g,%g,%g amb=%06X/%02X mamb=%06X/%02X upd=%u fix=%06X/%06X\n",
                 p.fb_fmt, type, count, vis, vt, f.through ? "2D" : "3D", p.fb, p.textured ? "" : "-", p.textured ? p.tex.addr : 0,
                 p.tex.fmt, p.tex.w, p.tex.h, p.tex_func, p.alpha_test, p.at_func, p.at_ref, p.depth_test, p.z_func, p.z_write,
                 p.blend, p.bl_a, p.bl_b, p.bl_eq, p.stencil_test, p.write_mask, zmin, zmax, g_verts[0].x, g_verts[0].y,
-                p.fog, ge_float(ge.cmd[GE_FOG1]), ge_float(ge.cmd[GE_FOG2]), g_verts[0].fog, ge.cmd[GE_FOGCOLOR]);
+                p.fog, ge_float(ge.cmd[GE_FOG1]), ge_float(ge.cmd[GE_FOG2]), g_verts[0].fog, ge.cmd[GE_FOGCOLOR],
+                lit, g_verts[0].r, g_verts[0].g, g_verts[0].b, g_verts[0].a, ge.cmd[GE_AMBIENTCOLOR], ge.cmd[GE_AMBIENTALPHA] & 255,
+                ge.cmd[GE_MATERIALAMBIENT], ge.cmd[GE_MATERIALALPHA] & 255, ge.cmd[GE_MATERIALUPDATE] & 7, ge.cmd[GE_BLENDFIXEDA], ge.cmd[GE_BLENDFIXEDB]);
     }
     if (!f.through) {
         g_draws_3d++;

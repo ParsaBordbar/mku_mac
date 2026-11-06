@@ -170,6 +170,9 @@ static void run_list(GeList *l) {
      * the CPU must sync (sceGeDrawSync, sceGeListSync) before it looks at the result.
      * The game feeds lists piecemeal through stall updates, so flushing here
      * would mean dozens of tiny batches per frame. */
+    static int eager = -1;
+    if (eager < 0) eager = getenv("MKU_EAGER") != NULL;
+    if (eager) gpu_flush();
 }
 
 void gpu_stats_report(void) {

@@ -180,6 +180,32 @@ final class Model: ObservableObject {
     }
 }
 
+/// A few screenshots, one after the other: Resources/screens/*.jpg
+struct Banner: View {
+    private static let images: [NSImage] = {
+        let dir = Bundle.main.resourceURL?.appendingPathComponent("screens")
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir ?? URL(fileURLWithPath: "/nonexistent"),
+                                                                  includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.pathExtension == "jpg" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .compactMap { NSImage(contentsOf: $0) }
+    }()
+
+    var body: some View {
+        if Banner.images.isEmpty {
+            EmptyView()
+        } else {
+            TimelineView(.periodic(from: Date(timeIntervalSince1970: 0), by: 5)) { context in
+                let i = Int(context.date.timeIntervalSince1970 / 5) % Banner.images.count
+                Image(nsImage: Banner.images[i])
+                    .resizable()
+                    .aspectRatio(480.0 / 272.0, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: Model
     var autoStart = true
@@ -187,12 +213,13 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 16) {
             Text("Mortal Kombat: Unchained").font(.title2).bold()
+            Banner().frame(height: 200)
             content.frame(maxWidth: .infinity, maxHeight: .infinity)
             Text("You need your own copy of the game. No game files come with this app.")
                 .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
         }
         .padding(24)
-        .frame(width: 440, height: 360)
+        .frame(width: 440, height: 580)
         .onAppear { if autoStart { model.start() } }
     }
 
@@ -287,7 +314,7 @@ func snapshots(into dir: String) {
         let model = Model()
         model.stage = stage
         let view = NSHostingView(rootView: ContentView(model: model, autoStart: false))
-        view.frame = NSRect(x: 0, y: 0, width: 440, height: 360)
+        view.frame = NSRect(x: 0, y: 0, width: 440, height: 580)
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.contentView = view
         window.appearance = NSAppearance(named: .aqua)   // readable on the PNG's transparent background

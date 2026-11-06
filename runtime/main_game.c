@@ -6,6 +6,7 @@
 void profile_start(void);
 void surf_init(void);
 void texpack_init(void);
+void default_profile_install(void);
 
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +23,7 @@ int main(int argc, char **argv) {
     settings_load();   /* mku.ini -> MKU_* (environment wins) */
     surf_init();
     texpack_init();
+    default_profile_install();
     host_init();
     kernel_init();
     profile_start();

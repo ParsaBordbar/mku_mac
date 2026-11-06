@@ -21,6 +21,8 @@ done
 cp -Rp third_party/PSPLibDoc.xml third_party/xbrz third_party/stb "$GAME/third_party/"
 cp -Rp deps "$GAME/deps"
 cp README.md "$APP/Contents/Resources/README.md"
+mkdir -p "$APP/Contents/Resources/screens"
+cp docs/screens/*.jpg "$APP/Contents/Resources/screens/"
 cat > "$APP/Contents/Resources/THIRD-PARTY.txt" <<'NOTES'
 Bundled, in game/third_party and game/deps:
 - SDL2 (zlib): https://libsdl.org. Licence: game/deps/SDL2-LICENSE.txt

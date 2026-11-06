@@ -149,7 +149,10 @@ void hle_sceDisplayGetFramePerSec(Ctx *c) { c->f[0] = 59.9400599f; }   /* return
 
 void hle_sceCtrlSetSamplingMode(Ctx *c) { RET(0); }
 
+void default_profile_tick(Ctx *c);   /* patches/default_profile.c */
+
 void hle_sceCtrlReadBufferPositive(Ctx *c) {
+    default_profile_tick(c);
     uint32_t data = A0, count = A1 ? A1 : 1;
     sched_wait(g_current, WAIT_DELAY, 0, next_vblank_us() - now_us() + 1, 0);   /* blocks until next sample */
     for (uint32_t i = 0; i < count; i++) {

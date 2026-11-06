@@ -41,6 +41,10 @@ Next time, just open the app and press Play.
 ./mku-play "Mortal Kombat - Unchained (USA).iso"
 ```
 
+You don't need to create a profile: a default one (PLAYER 1) is made and signed in for
+you, so every mode including Konquest just works. Your own profiles still work: press
+L at the main menu and enter your kode.
+
 The first run checks your ISO, tells you the install command if a free tool is
 missing, then translates the game for your computer (about a minute). After that
 it starts right away and remembers your ISO. You need:
@@ -82,8 +86,9 @@ times the original size. Load the folder with `./mku-play --pack my_textures/`.
 ### Known gaps
 
 - Intro movies are skipped, and there's no sound reverb.
-- Pressing F1 or F2 during a fight has made the stage background turn flat brown.
-  Your choice is saved, so restarting the game fixes it.
+- On some stages (Slaughterhouse, Konquest's training hall) the floor and parts of
+  the walls show as one flat colour. Still being investigated.
+- Konquest's open world runs at 20-30 fps for now; fights run at about 60.
 - Only tested on an Apple Silicon Mac so far.
 
 Saves are in `saves/` (the app keeps them in

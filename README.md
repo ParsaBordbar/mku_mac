@@ -6,15 +6,25 @@ code is translated to C and compiled for your machine.
 
 Remastered: 60 fps fights, up to 4x resolution, smoother textures, a free camera.
 
+| | |
+|---|---|
+| ![A fight on a lava stage, rendered at 960x544](docs/screens/1-fight.jpg) | ![A fight in a wooden hall](docs/screens/2-stage.jpg) |
+| ![The same game seen from a free camera angle](docs/screens/3-free-camera.jpg) | <img src="docs/screens/launcher.png" alt="The Mac launcher, with a Play button" width="300"> |
+
+*Rendered by this port at 960x544. Bottom left: the free camera. Bottom right: the Mac launcher.*
+
 ## No piracy: bring your own game
 
 **We do not provide, host or link to any game files, and we do not support piracy.**
 
 You must own the game and use an ISO made from your own copy. This repository
-contains only our own tools and runtime: no game code, no game data, and no
-pre-built version of the game. Everything game-related is generated on your
-computer, from your ISO. Please don't share game files, ISOs or built copies of
+contains only our own tools and runtime: no game code, no game data apart from a
+few screenshots, and no pre-built version of the game. Everything game-related is
+generated on your computer, from your ISO. Please don't share game files, ISOs or built copies of
 the game, and don't ask for them here.
+
+Mortal Kombat and all related characters and images are the property of their
+respective owners. This project is not affiliated with or endorsed by them.
 
 ## Play on a Mac (no coding needed)
 

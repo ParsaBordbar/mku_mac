@@ -122,6 +122,10 @@ extern int g_dump_draws;
 void raster_bench_report(void);
 
 void present_frame_shown(uint64_t frame) {
+    /* Frame numbers count SetFrameBuf calls, so shown numbers skip: test triggers
+     * fire when a number is passed, not only when it's hit exactly. */
+    static uint64_t prev_frame;
+#define CROSSED(n) ((uint64_t)(n) > prev_frame && (uint64_t)(n) <= frame)
     gpu_flush();   /* a swap without a sync still shows everything drawn so far */
     fps_stats();
     static long dump_at = -2;
@@ -138,13 +142,46 @@ void present_frame_shown(uint64_t frame) {
         nframes++;
         if (t - sec_start >= 1000000u) { host_report_fps((int)nframes); nframes = 0; sec_start = t; }
     }
+#ifdef RT_COVERAGE
+    {   /* MKU_COVER="from,to": list the functions entered between two frames */
+        static long from = -2, to;
+        if (from == -2) {
+            const char *e = getenv("MKU_COVER");
+            from = -1;
+            if (e) sscanf(e, "%ld,%ld", &from, &to);
+        }
+        extern uint8_t rt_cover[];
+        if (from >= 0 && CROSSED(from)) memset(rt_cover, 0, 0x00400000u);
+        if (from >= 0 && CROSSED(to)) {
+            FILE *f = fopen("build/cover.txt", "w");
+            for (uint32_t i = 0; f && i < 0x00400000u; i++)
+                if (rt_cover[i]) fprintf(f, "%08X\n", 0x08800000u + i * 4 - rt_image_base);
+            if (f) fclose(f);
+        }
+    }
+#endif
+    {   /* MKU_RAMDUMP="frame,frame": save PSP RAM to build/ram_<frame>.bin, to compare states */
+        static const char *dumps = (const char *)-1;
+        if (dumps == (const char *)-1) dumps = getenv("MKU_RAMDUMP");
+        for (const char *q = dumps; q && *q;) {
+            unsigned long long n = strtoull(q, NULL, 10);
+            if (CROSSED(n)) {
+                char path[64];
+                snprintf(path, sizeof path, "build/ram_%llu.bin", n);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(rt_ptr(0x08000000u), 1, 0x02000000u, f); fclose(f); }
+            }
+            q = strchr(q, ',');
+            if (q) q++;
+        }
+    }
     {   /* MKU_SET_AT="frame:scale:textures,..." does what the F1/F2 keys do, for tests */
         static const char *script = (const char *)-1;
         if (script == (const char *)-1) script = getenv("MKU_SET_AT");
         for (const char *q = script; q && *q;) {
             unsigned long long at;
             int sc, tx;
-            if (sscanf(q, "%llu:%d:%d", &at, &sc, &tx) == 3 && at == frame) {
+            if (sscanf(q, "%llu:%d:%d", &at, &sc, &tx) == 3 && CROSSED(at)) {
                 surf_set_scale(sc);
                 texpack_set_upscale(tx);
                 gpu_texture_cache_clear();
@@ -161,21 +198,18 @@ void present_frame_shown(uint64_t frame) {
     if (present_capture(rgba, &fw, &fh)) host_submit_frame(rgba, fw, fh);
     static const char *shots = (const char *)-1;
     if (shots == (const char *)-1) shots = getenv("MKU_SHOTS");
-    if (!shots) return;
-    char want[24];
-    snprintf(want, sizeof want, "%llu", (unsigned long long)frame);
-    for (const char *s = shots; *s;) {
-        size_t n = strcspn(s, ",");
-        if (n == strlen(want) && !strncmp(s, want, n)) {
-            uint32_t *px = rgba;
-            {
-                char path[64];
-                mkdir("build/shots", 0755);
-                snprintf(path, sizeof path, "build/shots/frame_%05llu.bmp", (unsigned long long)frame);
-                write_bmp(path, px, fw, fh);
-                fprintf(stderr, "[shot] %s at %.2f s\n", path, now_us() / 1e6);
-            }
+    for (const char *q = shots; q && *q;) {
+        unsigned long long n = strtoull(q, NULL, 10);
+        if (CROSSED(n)) {
+            char path[64];
+            mkdir("build/shots", 0755);
+            snprintf(path, sizeof path, "build/shots/frame_%05llu.bmp", n);
+            write_bmp(path, rgba, fw, fh);
+            fprintf(stderr, "[shot] %s at %.2f s\n", path, now_us() / 1e6);
         }
-        s += n + (s[n] == ',');
+        q = strchr(q, ',');
+        if (q) q++;
     }
+    prev_frame = frame;
+#undef CROSSED
 }

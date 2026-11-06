@@ -182,10 +182,17 @@ extern volatile uint32_t rt_cur_fn;
 typedef struct { uint32_t fn[RT_SHADOW_MAX]; int depth; } RtShadow;
 extern RtShadow *rt_shadow;
 static inline void rt_shadow_pop(int *depth) { rt_shadow->depth = *depth; }
+#ifdef RT_COVERAGE   /* make COVER=1 + MKU_COVER="from,to": which functions ran between two frames */
+extern uint8_t rt_cover[];
+#define RT_COVER_MARK(addr) (rt_cover[((addr) - 0x08800000u) >> 2] = 1)
+#else
+#define RT_COVER_MARK(addr) ((void)0)
+#endif
 #define RT_ENTER(addr) \
     int rt_depth_ __attribute__((cleanup(rt_shadow_pop), unused)) = rt_shadow->depth; \
     if (rt_depth_ < RT_SHADOW_MAX) rt_shadow->fn[rt_depth_] = (addr); \
     rt_shadow->depth = rt_depth_ + 1; \
+    RT_COVER_MARK(addr); \
     rt_cur_fn = (addr)
 void rt_shadow_print(const RtShadow *s, const char *indent);
 

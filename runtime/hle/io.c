@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -98,7 +99,8 @@ static int iso_lookup(const char *path, uint32_t *lbn, uint32_t *size, int *is_d
 /* ------------------------------------------------------------------------ */
 
 static int is_disc(const char *p) {
-    return !strncmp(p, "disc0:", 6) || !strncmp(p, "umd0:", 5) || !strncmp(p, "umd1:", 5) || !strchr(p, ':');
+    /* PSP device names ignore case: the game itself asks for "MS0:/PSP/..." */
+    return !strncasecmp(p, "disc0:", 6) || !strncasecmp(p, "umd0:", 5) || !strncasecmp(p, "umd1:", 5) || !strchr(p, ':');
 }
 
 static const char *after_device(const char *p) {
@@ -109,7 +111,7 @@ static const char *after_device(const char *p) {
 }
 
 static int ms_path(const char *guest, char *out, size_t n) {
-    if (strncmp(guest, "ms0:", 4) && strncmp(guest, "fatms0:", 7)) return 0;
+    if (strncasecmp(guest, "ms0:", 4) && strncasecmp(guest, "fatms0:", 7)) return 0;
     snprintf(out, n, "%s/%s", ms_root(), after_device(guest));
     return 1;
 }

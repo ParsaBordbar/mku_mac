@@ -14,6 +14,10 @@ volatile uint32_t rt_cur_fn;
 static RtShadow g_boot_shadow;
 RtShadow *rt_shadow = &g_boot_shadow;
 
+#ifdef RT_COVERAGE
+uint8_t rt_cover[0x00400000u];   /* one flag per instruction word of the executable */
+#endif
+
 void rt_thread_high_priority(void) {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -22,7 +26,7 @@ void rt_thread_high_priority(void) {
 
 void rt_shadow_print(const RtShadow *s, const char *indent) {
     int n = s->depth < RT_SHADOW_MAX ? s->depth : RT_SHADOW_MAX;
-    for (int i = n - 1; i >= 0 && i >= n - 12; i--)   /* innermost first */
+    for (int i = n - 1; i >= 0 && i >= n - 40; i--)   /* innermost first */
         fprintf(stderr, "%sfunc_%08X\n", indent, s->fn[i] - rt_image_base);
 }
 

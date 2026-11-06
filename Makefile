@@ -9,6 +9,10 @@ CC     := clang
 CXX    := clang++
 CFLAGS := -O2 -g -w -ffp-contract=off -fno-math-errno -Iruntime -Ibuild/recomp
 RT_OPT := -O3
+# make clean && make COVER=1: record which game functions run (MKU_COVER=from,to)
+ifneq ($(COVER),)
+CFLAGS += -DRT_COVERAGE
+endif
 # DEPS=deps: the small static libraries from tools/build_deps.sh (the Mac app
 # ships them, so players need no Homebrew). Otherwise, what's on this system.
 ifneq ($(DEPS),)
@@ -45,7 +49,7 @@ recomp: build/recomp/funcs.h
 
 # Second make pass so the wildcard sees the freshly generated files.
 game: recomp
-	@$(MAKE) --no-print-directory build/mku DEPS=$(DEPS)
+	@$(MAKE) --no-print-directory build/mku DEPS=$(DEPS) COVER=$(COVER)
 
 GEN_C   = $(wildcard build/recomp/*.c)
 RT_C    = $(wildcard runtime/*.c runtime/hle/*.c runtime/patches/*.c runtime/gpu/*.c runtime/host/*.c)

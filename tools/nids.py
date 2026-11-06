@@ -4,6 +4,7 @@ Run `tools/fetch_third_party.sh` first; the database is GPL-2.0 and lives in
 third_party/ (not committed).
 """
 
+from __future__ import annotations
 import os
 import xml.etree.ElementTree as ET
 

@@ -76,6 +76,25 @@ translation on the player's machine, from their ISO:
 4. Run the recompiler and compiler (about a minute, once).
 5. Start the game.
 
+## For people who don't code: the Mac app
+
+`launcher/macos/Launcher.swift` is a window over `mku-play`, in native Swift: about
+300 KB, where Tauri would add a Rust toolchain and megabytes for the same few screens.
+The hard part was never the window. It was removing what a player would have to
+install: `tools/build_deps.sh` builds SDL2 and an FFmpeg with only the ATRAC3 decoder
+as static libraries, so the app needs just Apple's free Command Line Tools.
+
+Testing on the machine you built on hides things. Three bugs only showed up by
+imitating someone else's Mac:
+
+- Apple's Python is 3.9 and the tools used 3.10 syntax. **Check:** with the fix, it
+  generates byte-identical C to the build the game had been running on.
+- `sdl2-libs.txt` held an absolute path into this machine's home folder. It linked here
+  and would have failed everywhere else. It was only caught by reading the output, so
+  `make_app.sh` now refuses such paths.
+- A quarantined app doesn't start at all until the player approves it, which is why
+  the README walks through **Open Anyway**.
+
 ## 🧑‍🎓 Exercises
 
 1. Dump textures (`MKU_TEXDUMP=1`), upscale a few with an AI tool, and load them

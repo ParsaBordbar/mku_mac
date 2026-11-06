@@ -19,6 +19,7 @@ pointer, because the linker told us which words are pointers.
 usage: python3 -I tools/find_functions.py BOOT.elf -o build/functions.csv
 """
 
+from __future__ import annotations
 import argparse
 import csv
 import os

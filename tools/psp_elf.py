@@ -16,6 +16,7 @@ Reference: PPSSPP Core/ELF/ElfReader.cpp (LoadRelocations) and
 pspsdk's psp-prxgen.
 """
 
+from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 

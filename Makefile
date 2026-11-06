@@ -9,6 +9,14 @@ CC     := clang
 CXX    := clang++
 CFLAGS := -O2 -g -w -ffp-contract=off -fno-math-errno -Iruntime -Ibuild/recomp
 RT_OPT := -O3
+# DEPS=deps: the small static libraries from tools/build_deps.sh (the Mac app
+# ships them, so players need no Homebrew). Otherwise, what's on this system.
+ifneq ($(DEPS),)
+SDL_CFLAGS := -I$(DEPS)/include/SDL2 -I$(DEPS)/include -D_THREAD_SAFE
+SDL_LIBS   := -L$(DEPS)/lib $(shell cat $(DEPS)/sdl2-libs.txt)
+AV_CFLAGS  := -I$(DEPS)/include
+AV_LIBS    := $(DEPS)/lib/libavcodec.a $(DEPS)/lib/libavutil.a
+else
 SDL_CFLAGS := $(shell sdl2-config --cflags)
 SDL_LIBS   := $(shell sdl2-config --libs)
 FFMPEG     := $(shell brew --prefix ffmpeg 2>/dev/null)
@@ -18,6 +26,7 @@ AV_LIBS    := -L$(FFMPEG)/lib -lavcodec -lavutil
 else
 AV_CFLAGS  := $(shell pkg-config --cflags libavcodec libavutil 2>/dev/null)
 AV_LIBS    := $(shell pkg-config --libs libavcodec libavutil 2>/dev/null)
+endif
 endif
 
 .PHONY: all recomp game run test clean pads
@@ -36,7 +45,7 @@ recomp: build/recomp/funcs.h
 
 # Second make pass so the wildcard sees the freshly generated files.
 game: recomp
-	@$(MAKE) --no-print-directory build/mku
+	@$(MAKE) --no-print-directory build/mku DEPS=$(DEPS)
 
 GEN_C   = $(wildcard build/recomp/*.c)
 RT_C    = $(wildcard runtime/*.c runtime/hle/*.c runtime/patches/*.c runtime/gpu/*.c runtime/host/*.c)

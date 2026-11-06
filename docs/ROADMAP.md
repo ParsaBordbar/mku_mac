@@ -94,6 +94,7 @@ Unnamed `func_001DD210` everywhere is miserable. Recover names first.
 ## Phase 10b — Remaster and player tool ✅ → [lesson 09](lessons/09-remaster.md)
 - 60 fps fights, 2x-4x resolution, xBRZ textures, texture packs, free camera.
 - `./mku-play game.iso`: builds from the player's own ISO, ships no game data.
+- `MK Unchained.app`: drop an ISO, press Play. No Homebrew, Apple's tools only.
 
 ## Phase 11 — Windows and Switch ⬜
 - Fibers already support x86-64 (System V): Linux and Intel Macs should build; untested.

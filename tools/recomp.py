@@ -22,6 +22,7 @@ usage:
   python3 -I tools/recomp.py --elf test.elf --out build/tests/x        (test programs)
 """
 
+from __future__ import annotations
 import argparse
 import os
 import re

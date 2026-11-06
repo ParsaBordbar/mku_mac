@@ -25,6 +25,7 @@ ROOT = os.path.dirname(os.path.realpath(__file__))
 BUILD_ELF = os.path.join("build", "game", "BOOT.elf")
 LAST_ISO = os.path.join("build", "game", "last_iso.txt")
 SAVES = "saves"
+BUNDLED_DEPS = os.path.join("deps", "sdl2-libs.txt")
 INI = "mku.ini"
 
 SECTOR = 2048
@@ -67,7 +68,7 @@ def read_iso_file(f, path):
     f.seek(16 * SECTOR)
     pvd = f.read(SECTOR)
     if len(pvd) < SECTOR or pvd[1:6] != b"CD001":
-        raise IsoError("this isn't an ISO disc image")
+        raise IsoError("This isn't an ISO disc image.")
     lba = struct.unpack_from("<I", pvd, 156 + 2)[0]
     size = struct.unpack_from("<I", pvd, 156 + 10)[0]
     parts = path.upper().split("/")
@@ -100,21 +101,21 @@ def load_game(iso_path):
     try:
         f = open(iso_path, "rb")
     except OSError as e:
-        raise IsoError(f"can't open it: {e.strerror}")
+        raise IsoError(f"This file can't be opened: {e.strerror}")
     with f:
         head = f.read(4)
         if head in (b"CISO", b"ZISO"):
-            raise IsoError("this is a compressed image (CSO/ZSO). Convert it to a plain .iso first.")
+            raise IsoError("This is a compressed image (CSO/ZSO). Convert it to a plain .iso first.")
         exe = read_iso_file(f, EXE_PATH)
         sfo = read_iso_file(f, SFO_PATH)
     if exe is None:
-        raise IsoError("this isn't a PSP game disc (no PSP_GAME/SYSDIR/BOOT.BIN)")
+        raise IsoError("This isn't a PSP game disc (no PSP_GAME/SYSDIR/BOOT.BIN).")
     disc_id = sfo_field(sfo, "DISC_ID") or "unknown"
     if not exe.strip(b"\0"):
-        raise IsoError("this dump's BOOT.BIN is blank. Some dumps remove it; please dump your disc again unmodified.")
+        raise IsoError("This dump's BOOT.BIN is blank. Some dumps remove it; please dump your disc again unmodified.")
     digest = hashlib.sha256(exe).hexdigest()
     if digest not in SUPPORTED:
-        raise IsoError(f"unsupported game or version (disc id {disc_id}, BOOT.BIN sha-256 {digest[:16]}...).\n"
+        raise IsoError(f"This is an unsupported game or version (disc id {disc_id}, BOOT.BIN sha-256 {digest[:16]}...).\n"
                        "Supported: " + "; ".join(SUPPORTED.values()))
     return exe, SUPPORTED[digest]
 
@@ -129,6 +130,8 @@ def missing_tools():
     for tool in ("make", "clang"):
         if not shutil.which(tool):
             missing.append((tool, "xcode-select --install" if mac else "sudo apt install make clang"))
+    if os.path.exists(BUNDLED_DEPS):   # the Mac app brings its own SDL2 and FFmpeg
+        return missing
     if not shutil.which("sdl2-config"):
         missing.append(("SDL2", "brew install sdl2" if mac else "sudo apt install libsdl2-dev"))
     if mac:
@@ -166,7 +169,8 @@ def build(exe):
             f.write(exe)
     if not os.path.exists("build/mku"):
         print("First run: translating the game for this computer. This takes about a minute...")
-    r = subprocess.run(["make", f"-j{os.cpu_count() or 4}", "game", f"ELF={BUILD_ELF}"],
+    deps = ["DEPS=deps"] if os.path.exists(BUNDLED_DEPS) else []
+    r = subprocess.run(["make", f"-j{os.cpu_count() or 4}", "game", f"ELF={BUILD_ELF}"] + deps,
                        capture_output=True, text=True)
     if r.returncode:
         sys.stdout.write(r.stdout[-2000:])

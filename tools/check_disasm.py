@@ -9,6 +9,7 @@ usage: python3 -I tools/check_disasm.py BOOT.elf [--show 20]
 needs: brew install llvm
 """
 
+from __future__ import annotations
 import argparse
 import os
 import re

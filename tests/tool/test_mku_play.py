@@ -140,7 +140,7 @@ try:
     mku.load_game("/nonexistent/game.iso")
     check("missing file", False)
 except mku.IsoError as e:
-    check("missing file", "can't open" in str(e))
+    check("missing file", "can't be opened" in str(e))
 
 check("sfo field", mku.sfo_field(make_sfo("ULUS10102"), "DISC_ID") == "ULUS10102")
 check("sfo missing key", mku.sfo_field(make_sfo("ULUS10102"), "TITLE") is None)

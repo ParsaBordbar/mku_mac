@@ -16,19 +16,35 @@ pre-built version of the game. Everything game-related is generated on your
 computer, from your ISO. Please don't share game files, ISOs or built copies of
 the game, and don't ask for them here.
 
-## Play
+## Play on a Mac (no coding needed)
+
+You need a Mac with Apple Silicon (M1 or newer) on macOS 13 or later, and the ISO of
+your own copy: the US version, ULUS-10102 v1.03, as a plain `.iso` (not CSO).
+Other versions are refused.
+
+1. Download **MK-Unchained-mac.zip** from
+   [Releases](https://github.com/ParsaBordbar/mku_mac/releases), unzip it, and move
+   **MK Unchained** to your Applications folder.
+2. Open it. macOS blocks it the first time, because the app isn't notarized by Apple.
+   Click **Done**, then go to **System Settings > Privacy & Security**, scroll down, and
+   click **Open Anyway**.
+3. Drop your ISO onto the window.
+4. If Apple's Command Line Tools aren't installed, a window asks: click **Install**. It's
+   free and from Apple. The app carries on by itself when it's done.
+5. Wait about a minute while the game is prepared for your Mac, then press **Play**.
+
+Next time, just open the app and press Play.
+
+## Play from a terminal
 
 ```sh
 ./mku-play "Mortal Kombat - Unchained (USA).iso"
 ```
 
-On a Mac you can also double-click **Play MK Unchained.command**.
-
 The first run checks your ISO, tells you the install command if a free tool is
 missing, then translates the game for your computer (about a minute). After that
 it starts right away and remembers your ISO. You need:
 
-- The US version, ULUS-10102 v1.03, as a plain `.iso` (not CSO). Other versions are refused.
 - macOS: `xcode-select --install`, then `brew install sdl2 ffmpeg`.
 - Linux (should work, not tested yet): `sudo apt install make clang libsdl2-dev pkg-config libavcodec-dev libavutil-dev`.
 
@@ -70,11 +86,14 @@ times the original size. Load the folder with `./mku-play --pack my_textures/`.
   Your choice is saved, so restarting the game fixes it.
 - Only tested on an Apple Silicon Mac so far.
 
-Saves are in `saves/`.
+Saves are in `saves/` (the app keeps them in
+`~/Library/Application Support/MK Unchained/game/saves/`).
 
 ---
 
 # For developers
+
+To build the Mac app: `tools/build_deps.sh && tools/make_app.sh` (makes `dist/`).
 
 A learning project: a port of the game (internal module name `MK6`) by **static
 recompilation**: translate the MIPS machine code to C ahead of time, like

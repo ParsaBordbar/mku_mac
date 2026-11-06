@@ -6,6 +6,7 @@ Two sources:
                  symbol table that tells us the functions directly
 """
 
+from __future__ import annotations
 import csv
 import os
 import struct

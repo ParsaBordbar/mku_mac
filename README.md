@@ -1,3 +1,6 @@
+<img width="2560" height="1665" alt="telegram-cloud-photo-size-4-6010402347156180531-w" src="https://github.com/user-attachments/assets/9c9822a6-9500-48ba-b3a9-77c377029166" />
+
+
 # Mortal Kombat: Unchained, native
 
 Play *Mortal Kombat: Unchained* (PSP, 2006) as a native program on a modern
